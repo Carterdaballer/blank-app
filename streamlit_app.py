@@ -13,12 +13,12 @@ import streamlit as st
 # =========================================================
 
 st.set_page_config(
-    page_title="Matchup Edge V5",
+    page_title="Cheating Vegas with Mike",
     page_icon="🏈",
     layout="wide",
 )
 
-st.title("🏈 Matchup Edge V5")
+st.title("🏈 Cheating Vegas with Mike")
 st.caption(
     "Independent college-football matchup model • "
     "Consensus ratings → matchup → fair line → price → EV"
