@@ -820,3 +820,256 @@ except Exception as error:
     )
 
     st.code(str(error))
+
+
+
+# =========================================================
+# V3B — OPPONENT-ADJUSTED POWER RATING
+# =========================================================
+
+st.divider()
+st.header("⚡ V3B — Opponent-Adjusted Power Rating")
+
+@st.cache_data(ttl=3600)
+def get_all_games_through_week(year, selected_week, api_key):
+    all_games = []
+
+    for w in range(0, selected_week):
+        week_games = cfbd_get(
+            "/games",
+            {
+                "year": year,
+                "week": w,
+                "seasonType": "regular",
+            },
+            api_key,
+        )
+
+        all_games.extend(week_games)
+
+    return all_games
+
+
+def build_team_margins(all_games):
+    team_games = {}
+
+    # Game IDs protect us from accidentally counting
+    # the same game twice.
+    seen_game_ids = set()
+
+    for game in all_games:
+        game_id = get_field(
+            game,
+            "id",
+            default=None,
+        )
+
+        if game_id is not None:
+            if game_id in seen_game_ids:
+                continue
+
+            seen_game_ids.add(game_id)
+
+        home = get_field(
+            game,
+            "homeTeam",
+            "home_team",
+            default="",
+        )
+
+        away = get_field(
+            game,
+            "awayTeam",
+            "away_team",
+            default="",
+        )
+
+        home_points = get_field(
+            game,
+            "homePoints",
+            "home_points",
+        )
+
+        away_points = get_field(
+            game,
+            "awayPoints",
+            "away_points",
+        )
+
+        if (
+            not home
+            or not away
+            or home_points is None
+            or away_points is None
+        ):
+            continue
+
+        home_margin = home_points - away_points
+        away_margin = away_points - home_points
+
+        team_games.setdefault(home, []).append(
+            {
+                "opponent": away,
+                "margin": home_margin,
+            }
+        )
+
+        team_games.setdefault(away, []).append(
+            {
+                "opponent": home,
+                "margin": away_margin,
+            }
+        )
+
+    return team_games
+
+
+def calculate_power_ratings(team_games):
+    # Start with each team's raw average scoring margin.
+    ratings = {}
+
+    for team, games_list in team_games.items():
+        if games_list:
+            ratings[team] = sum(
+                game["margin"]
+                for game in games_list
+            ) / len(games_list)
+
+    # Repeatedly adjust each team for the strength
+    # of the opponents it has faced.
+    for _ in range(12):
+        new_ratings = {}
+
+        for team, games_list in team_games.items():
+            adjusted_performances = []
+
+            for game in games_list:
+                opponent_rating = ratings.get(
+                    game["opponent"],
+                    0.0,
+                )
+
+                adjusted_performances.append(
+                    game["margin"] + opponent_rating
+                )
+
+            if adjusted_performances:
+                new_ratings[team] = sum(
+                    adjusted_performances
+                ) / len(adjusted_performances)
+
+        if new_ratings:
+            # Re-center ratings around zero so the scale
+            # represents strength relative to the field.
+            average_rating = sum(
+                new_ratings.values()
+            ) / len(new_ratings)
+
+            ratings = {
+                team: rating - average_rating
+                for team, rating in new_ratings.items()
+            }
+
+    return ratings
+
+
+try:
+    all_prior_games = get_all_games_through_week(
+        season,
+        week,
+        CFBD_API_KEY,
+    )
+
+    team_games = build_team_margins(
+        all_prior_games
+    )
+
+    power_ratings = calculate_power_ratings(
+        team_games
+    )
+
+    away_power = power_ratings.get(
+        away_team,
+        0.0,
+    )
+
+    home_power = power_ratings.get(
+        home_team,
+        0.0,
+    )
+
+    # Initial home-field assumption.
+    # We will calibrate this later from historical data.
+    home_field_advantage = 2.5
+
+    preliminary_home_margin = (
+        home_power
+        - away_power
+        + home_field_advantage
+    )
+
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader(away_team)
+
+        st.metric(
+            "Power Rating",
+            f"{away_power:+.1f}",
+        )
+
+    with col2:
+        st.subheader(home_team)
+
+        st.metric(
+            "Power Rating",
+            f"{home_power:+.1f}",
+        )
+
+
+    st.caption(
+        "0.0 represents approximately average strength "
+        "within the current rating pool. Positive is "
+        "stronger; negative is weaker."
+    )
+
+
+    st.subheader("🎯 Preliminary Model Spread")
+
+    if preliminary_home_margin >= 0:
+        st.metric(
+            "Model Fair Spread",
+            f"{home_team} "
+            f"-{preliminary_home_margin:.1f}",
+        )
+
+    else:
+        st.metric(
+            "Model Fair Spread",
+            f"{away_team} "
+            f"-{abs(preliminary_home_margin):.1f}",
+        )
+
+
+    st.write(
+        f"**Home-field adjustment:** "
+        f"{home_field_advantage:+.1f} points"
+    )
+
+    st.info(
+        "This is an early opponent-adjusted rating, "
+        "not the finished Matchup Edge prediction. "
+        "QB, efficiency, roster strength, injuries, "
+        "matchup factors and other inputs still need "
+        "to be added."
+    )
+
+
+except Exception as error:
+    st.error(
+        "Opponent-adjusted power ratings "
+        "could not be calculated."
+    )
+
+    st.code(str(error))
