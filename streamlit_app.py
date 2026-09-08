@@ -587,3 +587,236 @@ except Exception as error:
     )
 
     st.code(str(error))
+
+
+# =========================================================
+# V3B — TEAM GAME HISTORY
+# =========================================================
+
+st.divider()
+st.header("🏈 Team Game History")
+
+@st.cache_data(ttl=3600)
+def get_team_games(year, team, api_key):
+    return cfbd_get(
+        "/games",
+        {
+            "year": year,
+            "team": team,
+            "seasonType": "regular",
+        },
+        api_key,
+    )
+
+
+def build_game_history(games, team, selected_week):
+    history = []
+
+    for game in games:
+        game_week = get_field(
+            game,
+            "week",
+            default=0,
+        )
+
+        # Only use games before the selected matchup.
+        # This prevents future results from leaking into the model.
+        if game_week >= selected_week:
+            continue
+
+        home = get_field(
+            game,
+            "homeTeam",
+            "home_team",
+            default="",
+        )
+
+        away = get_field(
+            game,
+            "awayTeam",
+            "away_team",
+            default="",
+        )
+
+        home_points = get_field(
+            game,
+            "homePoints",
+            "home_points",
+        )
+
+        away_points = get_field(
+            game,
+            "awayPoints",
+            "away_points",
+        )
+
+        # Skip games that have not been completed.
+        if home_points is None or away_points is None:
+            continue
+
+        if team == home:
+            opponent = away
+            points_for = home_points
+            points_against = away_points
+            location = "Home"
+        else:
+            opponent = home
+            points_for = away_points
+            points_against = home_points
+            location = "Away"
+
+        margin = points_for - points_against
+
+        if margin > 0:
+            result = "W"
+        elif margin < 0:
+            result = "L"
+        else:
+            result = "T"
+
+        history.append(
+            {
+                "Week": game_week,
+                "Opponent": opponent,
+                "Location": location,
+                "Result": result,
+                "PF": points_for,
+                "PA": points_against,
+                "Margin": margin,
+            }
+        )
+
+    return sorted(
+        history,
+        key=lambda x: x["Week"],
+    )
+
+
+try:
+    away_games_raw = get_team_games(
+        season,
+        away_team,
+        CFBD_API_KEY,
+    )
+
+    home_games_raw = get_team_games(
+        season,
+        home_team,
+        CFBD_API_KEY,
+    )
+
+    away_history = build_game_history(
+        away_games_raw,
+        away_team,
+        week,
+    )
+
+    home_history = build_game_history(
+        home_games_raw,
+        home_team,
+        week,
+    )
+
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader(away_team)
+
+        if away_history:
+            away_df = pd.DataFrame(away_history)
+            st.dataframe(
+                away_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            away_avg_margin = (
+                away_df["Margin"].mean()
+            )
+
+            away_avg_pf = (
+                away_df["PF"].mean()
+            )
+
+            away_avg_pa = (
+                away_df["PA"].mean()
+            )
+
+            st.metric(
+                "Average Scoring Margin",
+                f"{away_avg_margin:+.1f}",
+            )
+
+            st.write(
+                f"**Points/Game:** {away_avg_pf:.1f}"
+            )
+
+            st.write(
+                f"**Points Allowed/Game:** "
+                f"{away_avg_pa:.1f}"
+            )
+
+        else:
+            st.info(
+                "No completed games before "
+                "this matchup."
+            )
+
+
+    with col2:
+        st.subheader(home_team)
+
+        if home_history:
+            home_df = pd.DataFrame(home_history)
+            st.dataframe(
+                home_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            home_avg_margin = (
+                home_df["Margin"].mean()
+            )
+
+            home_avg_pf = (
+                home_df["PF"].mean()
+            )
+
+            home_avg_pa = (
+                home_df["PA"].mean()
+            )
+
+            st.metric(
+                "Average Scoring Margin",
+                f"{home_avg_margin:+.1f}",
+            )
+
+            st.write(
+                f"**Points/Game:** {home_avg_pf:.1f}"
+            )
+
+            st.write(
+                f"**Points Allowed/Game:** "
+                f"{home_avg_pa:.1f}"
+            )
+
+        else:
+            st.info(
+                "No completed games before "
+                "this matchup."
+            )
+
+
+    st.success(
+        "Historical results loaded automatically "
+        "without using future games."
+    )
+
+
+except Exception as error:
+    st.error(
+        "Team game history could not load."
+    )
+
+    st.code(str(error))
