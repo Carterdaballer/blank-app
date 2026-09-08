@@ -1,34 +1,88 @@
 import math
-import streamlit as st
+import json
+import urllib.parse
+import urllib.request
+
 import pandas as pd
+import streamlit as st
+
+
+# =========================================================
+# PAGE SETUP
+# =========================================================
 
 st.set_page_config(
-    page_title="Matchup Edge v2",
+    page_title="Matchup Edge V3",
     page_icon="🏈",
-    layout="wide"
+    layout="wide",
 )
 
-st.title("🏈 Matchup Edge v2")
-st.caption("Automatic matchup model + line testing + EV analysis")
+st.title("🏈 Matchup Edge V3")
+st.caption("Live college football schedule + matchup analysis + line testing")
 
 st.warning(
     "For research and entertainment only. "
-    "This model does not guarantee profitable betting results."
+    "Model probabilities are estimates and do not guarantee profitable bets."
 )
 
-# -----------------------------
-# Utility functions
-# -----------------------------
+
+# =========================================================
+# CFBD API
+# =========================================================
+
+try:
+    CFBD_API_KEY = st.secrets["CFBD_API_KEY"]
+except Exception:
+    st.error("CFBD API key is not configured in Streamlit Secrets.")
+    st.stop()
+
+
+@st.cache_data(ttl=3600)
+def cfbd_get(path, params, api_key):
+    query_string = urllib.parse.urlencode(params)
+
+    url = (
+        "https://api.collegefootballdata.com"
+        + path
+        + "?"
+        + query_string
+    )
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+    )
+
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def get_field(data, *names, default=None):
+    for name in names:
+        if name in data and data[name] is not None:
+            return data[name]
+
+    return default
+
+
+# =========================================================
+# BETTING UTILITY FUNCTIONS
+# =========================================================
 
 def american_to_decimal(odds):
     if odds > 0:
-        return 1 + odds / 100
-    return 1 + 100 / abs(odds)
+        return 1 + (odds / 100)
+
+    return 1 + (100 / abs(odds))
 
 
 def american_to_implied_prob(odds):
     if odds > 0:
         return 100 / (odds + 100)
+
     return abs(odds) / (abs(odds) + 100)
 
 
@@ -42,68 +96,64 @@ def spread_cover_probability(
     line,
     home_team,
     away_team,
-    sigma=13.5
+    sigma=13.5,
 ):
     if bet_team == home_team:
-        threshold = -line
-        z = (model_margin_home - threshold) / sigma
-        return normal_cdf(z)
+        expected_margin = model_margin_home
+    else:
+        expected_margin = -model_margin_home
 
-    model_margin_away = -model_margin_home
     threshold = -line
-    z = (model_margin_away - threshold) / sigma
 
-    return normal_cdf(z)
+    return 1 - normal_cdf(
+        (threshold - expected_margin) / sigma
+    )
 
 
 def total_probability(
     model_total,
     direction,
     line,
-    sigma=14.0
+    sigma=14.0,
 ):
-    if direction == "Over":
-        z = (model_total - line) / sigma
-        return normal_cdf(z)
+    probability_under = normal_cdf(
+        (line - model_total) / sigma
+    )
 
-    z = (line - model_total) / sigma
-    return normal_cdf(z)
+    if direction == "Under":
+        return probability_under
+
+    return 1 - probability_under
 
 
 def moneyline_probability(
     model_margin_home,
     selected_team,
     home_team,
-    away_team
+    away_team,
 ):
-    scale = 6.5
-
-    p_home = 1 / (
-        1 + math.exp(
-            -model_margin_home / scale
-        )
+    home_probability = 1 / (
+        1 + math.exp(-model_margin_home / 6.5)
     )
 
     if selected_team == home_team:
-        return p_home
+        return home_probability
 
-    return 1 - p_home
+    return 1 - home_probability
 
 
-def expected_value_per_dollar(
-    model_prob,
-    odds
-):
+def expected_value_per_dollar(model_prob, odds):
     decimal_odds = american_to_decimal(odds)
 
+    profit_if_win = decimal_odds - 1
+
     return (
-        model_prob * (decimal_odds - 1)
+        model_prob * profit_if_win
         - (1 - model_prob)
     )
 
 
 def edge_grade(prob_edge):
-
     if prob_edge >= 0.08:
         return "A"
 
@@ -116,11 +166,7 @@ def edge_grade(prob_edge):
     return "PASS"
 
 
-def suggested_units(
-    prob_edge,
-    ev
-):
-
+def suggested_units(prob_edge, ev):
     if prob_edge < 0.015 or ev <= 0:
         return 0.0
 
@@ -136,870 +182,309 @@ def suggested_units(
     return 2.0
 
 
-def pct(x):
-    return f"{100 * x:.1f}%"
-
-
-# -----------------------------
-# MATCHUP DATABASE
-# -----------------------------
-# This is the part we will eventually
-# replace with automatic sports data feeds.
-
-MATCHUPS = {
-
-    "Kansas vs Missouri": {
-
-        "away_team": "Missouri",
-
-        "home_team": "Kansas",
-
-        "model_margin_home": 2.75,
-
-        "model_total": 50.8,
-
-        "confidence": 69,
-
-        "top_edges": [
-
-            ("Missouri QB", -3.8),
-
-            ("Missouri Offensive Line", -3.2),
-
-            ("Kansas Home Field", 2.6),
-
-            (
-                "Kansas Coaching / Rivalry Spot",
-                2.1
-            ),
-
-            (
-                "Kansas Defensive Matchup",
-                1.8
-            )
-        ],
-
-        "notes": [
-            "Prototype matchup model.",
-            "Rerun when injuries or major news changes."
-        ]
-    },
-
-
-    "Oregon at Oklahoma State": {
-
-        "away_team": "Oregon",
-
-        "home_team": "Oklahoma State",
-
-        "model_margin_home": -25.4,
-
-        "model_total": 55.8,
-
-        "confidence": 72,
-
-        "top_edges": [
-
-            (
-                "Oregon Defensive Front",
-                -6.0
-            ),
-
-            (
-                "Oregon Passing Attack",
-                -5.8
-            ),
-
-            (
-                "Oregon Skill Talent",
-                -5.6
-            ),
-
-            (
-                "Oregon Offensive Line",
-                -5.0
-            ),
-
-            (
-                "Oklahoma State Home Field",
-                2.4
-            )
-        ],
-
-        "notes": [
-            "Prototype matchup model.",
-            "Users can test unlimited alternate lines against the same evaluation."
-        ]
-    }
-}
-
-
-# -----------------------------
-# Sidebar
-# -----------------------------
-
-with st.sidebar:
-
-    st.header("How Matchup Edge Works")
-
-    st.markdown(
-        """
-        1. Select a matchup.
-
-        2. The model loads a fair spread
-        and projected total.
-
-        3. Enter any sportsbook line.
-
-        4. Enter the odds.
-
-        5. The app calculates:
-        - Model probability
-        - Break-even probability
-        - Probability edge
-        - Expected value
-        - Bet grade
-        - Suggested units
-        """
-    )
-
-    st.info(
-        "Future versions will automatically "
-        "pull injuries, rosters, statistics, "
-        "weather and sportsbook odds."
-    )
-
-
-# -----------------------------
-# MATCHUP SELECTION
-# -----------------------------
-
-st.header("1. Select Matchup")
-
-matchup_name = st.selectbox(
-    "Game",
-    list(MATCHUPS.keys())
-)
-
-m = MATCHUPS[matchup_name]
-
-away_team = m["away_team"]
-
-home_team = m["home_team"]
-
-model_margin_home = float(
-    m["model_margin_home"]
-)
-
-model_total = float(
-    m["model_total"]
-)
-
-confidence = int(
-    m["confidence"]
-)
-
-
-if model_margin_home < 0:
-
-    model_spread_text = (
-        f"{away_team} "
-        f"-{abs(model_margin_home):.1f}"
-    )
-
-else:
-
-    model_spread_text = (
-        f"{home_team} "
-        f"-{abs(model_margin_home):.1f}"
-    )
-
-
-c1, c2, c3 = st.columns(3)
-
-c1.metric(
-    "Model Fair Spread",
-    model_spread_text
-)
-
-c2.metric(
-    "Model Fair Total",
-    f"{model_total:.1f}"
-)
-
-c3.metric(
-    "Matchup Confidence",
-    f"{confidence}/100"
-)
-
-
-st.subheader("Top Matchup Edges")
-
-
-for label, value in m["top_edges"]:
-
-    if value > 0:
-        side = home_team
-
-    elif value < 0:
-        side = away_team
-
-    else:
-        side = "Even"
-
-
-    st.write(
-        f"**{label}:** "
-        f"{side} "
-        f"({value:+.1f})"
-    )
-
-
-for note in m["notes"]:
-    st.caption(note)
-
+# =========================================================
+# LIVE SCHEDULE
+# =========================================================
 
 st.divider()
 
+st.header("📅 Live 2026 FBS Schedule")
 
-# -----------------------------
-# TEST ONE BET
-# -----------------------------
+season = st.selectbox(
+    "Season",
+    [2026],
+)
 
-st.header("2. Test a Bet")
+week = st.selectbox(
+    "Week",
+    list(range(0, 17)),
+    index=2,
+)
+
+
+try:
+    games = cfbd_get(
+        "/games",
+        {
+            "year": season,
+            "week": week,
+            "seasonType": "regular",
+            "classification": "fbs",
+        },
+        CFBD_API_KEY,
+    )
+
+except Exception as error:
+    st.error(
+        "We couldn't load the CFBD schedule. "
+        "Double-check the API key and try again."
+    )
+
+    st.code(str(error))
+    st.stop()
+
+
+if not games:
+    st.info(
+        f"No FBS games were returned for Week {week}."
+    )
+
+    st.stop()
+
+
+# =========================================================
+# NORMALIZE GAME DATA
+# =========================================================
+
+normalized_games = []
+
+for game in games:
+    away_team = get_field(
+        game,
+        "awayTeam",
+        "away_team",
+        default="Away Team",
+    )
+
+    home_team = get_field(
+        game,
+        "homeTeam",
+        "home_team",
+        default="Home Team",
+    )
+
+    start_date = get_field(
+        game,
+        "startDate",
+        "start_date",
+        default="",
+    )
+
+    venue = get_field(
+        game,
+        "venue",
+        default="",
+    )
+
+    home_points = get_field(
+        game,
+        "homePoints",
+        "home_points",
+    )
+
+    away_points = get_field(
+        game,
+        "awayPoints",
+        "away_points",
+    )
+
+    game_id = get_field(
+        game,
+        "id",
+        default="",
+    )
+
+    normalized_games.append(
+        {
+            "id": game_id,
+            "away_team": away_team,
+            "home_team": home_team,
+            "start_date": start_date,
+            "venue": venue,
+            "home_points": home_points,
+            "away_points": away_points,
+            "raw": game,
+        }
+    )
+
+
+game_labels = [
+    f"{game['away_team']} @ {game['home_team']}"
+    for game in normalized_games
+]
+
+
+selected_label = st.selectbox(
+    "Select Game",
+    game_labels,
+)
+
+
+selected_index = game_labels.index(selected_label)
+
+selected_game = normalized_games[selected_index]
+
+away_team = selected_game["away_team"]
+home_team = selected_game["home_team"]
+
+
+# =========================================================
+# SELECTED GAME
+# =========================================================
+
+st.subheader("🏟️ Selected Matchup")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.metric(
+        "Away Team",
+        away_team,
+    )
+
+with col2:
+    st.metric(
+        "Home Team",
+        home_team,
+    )
+
+with col3:
+    st.metric(
+        "Week",
+        week,
+    )
+
+
+if selected_game["start_date"]:
+    st.write(
+        f"**Kickoff:** {selected_game['start_date']}"
+    )
+
+
+if selected_game["venue"]:
+    st.write(
+        f"**Venue:** {selected_game['venue']}"
+    )
+
+
+if (
+    selected_game["away_points"] is not None
+    and selected_game["home_points"] is not None
+):
+    st.write(
+        "**Score:** "
+        f"{away_team} {selected_game['away_points']} — "
+        f"{home_team} {selected_game['home_points']}"
+    )
+
+
+# =========================================================
+# V3A STATUS
+# =========================================================
+
+st.divider()
+
+st.header("🧠 Matchup Model")
+
+st.success(
+    "CFBD schedule connection is active. "
+    "This matchup was loaded automatically from the 2026 schedule."
+)
+
+st.info(
+    "V3A connects the schedule. "
+    "V3B will calculate automatic team ratings from real results "
+    "and statistics before we turn the betting model back on for "
+    "every matchup."
+)
+
+
+# =========================================================
+# MANUAL LINE LAB
+# =========================================================
+
+st.divider()
+
+st.header("🧪 Line Lab")
+
+st.write(
+    "The sportsbook line-testing engine will use the automatic "
+    "matchup rating once V3B is connected."
+)
 
 bet_type = st.selectbox(
     "Bet Type",
     [
         "Spread",
         "Total",
-        "Moneyline"
-    ]
+        "Moneyline",
+    ],
 )
 
+american_odds = st.number_input(
+    "American Odds",
+    min_value=-10000,
+    max_value=10000,
+    value=-110,
+    step=1,
+)
 
-if bet_type == "Spread":
-
-    team = st.selectbox(
-        "Team",
-        [
-            away_team,
-            home_team
-        ]
+if american_odds == 0:
+    st.warning(
+        "American odds cannot be 0."
     )
-
-    line = st.number_input(
-        "Spread Line",
-        value=-3.5,
-        step=0.5,
-        help=(
-            "Examples: -22.5 or +7.5"
-        )
-    )
-
-    odds = st.number_input(
-        "American Odds",
-        value=-110,
-        step=5
-    )
-
-
-elif bet_type == "Total":
-
-    direction = st.selectbox(
-        "Side",
-        [
-            "Over",
-            "Under"
-        ]
-    )
-
-    line = st.number_input(
-        "Total Line",
-        value=float(
-            round(model_total * 2) / 2
-        ),
-        step=0.5
-    )
-
-    odds = st.number_input(
-        "American Odds",
-        value=-110,
-        step=5
-    )
-
-
 else:
-
-    team = st.selectbox(
-        "Team",
-        [
-            away_team,
-            home_team
-        ]
+    break_even = american_to_implied_prob(
+        american_odds
     )
 
-    odds = st.number_input(
-        "American Odds",
-        value=-110,
-        step=5
+    st.metric(
+        "Sportsbook Break-even Probability",
+        f"{break_even * 100:.1f}%",
     )
 
 
-if st.button(
-    "🔎 ANALYZE BET",
-    type="primary",
-    use_container_width=True
-):
-
-    implied = american_to_implied_prob(
-        int(odds)
-    )
-
-
-    if bet_type == "Spread":
-
-        model_prob = (
-            spread_cover_probability(
-                model_margin_home,
-                team,
-                float(line),
-                home_team,
-                away_team
-            )
-        )
-
-        label = (
-            f"{team} "
-            f"{line:+.1f}"
-        )
-
-        if team == home_team:
-
-            fair_team_spread = (
-                -model_margin_home
-            )
-
-        else:
-
-            fair_team_spread = (
-                model_margin_home
-            )
-
-
-        point_edge = (
-            fair_team_spread
-            - float(line)
-        )
-
-
-    elif bet_type == "Total":
-
-        model_prob = (
-            total_probability(
-                model_total,
-                direction,
-                float(line)
-            )
-        )
-
-        label = (
-            f"{direction} "
-            f"{line:.1f}"
-        )
-
-
-        if direction == "Over":
-
-            point_edge = (
-                model_total
-                - float(line)
-            )
-
-        else:
-
-            point_edge = (
-                float(line)
-                - model_total
-            )
-
-
-    else:
-
-        model_prob = (
-            moneyline_probability(
-                model_margin_home,
-                team,
-                home_team,
-                away_team
-            )
-        )
-
-        label = (
-            f"{team} ML"
-        )
-
-        point_edge = None
-
-
-    prob_edge = (
-        model_prob
-        - implied
-    )
-
-
-    ev = expected_value_per_dollar(
-        model_prob,
-        int(odds)
-    )
-
-
-    grade = edge_grade(
-        prob_edge
-    )
-
-
-    units = suggested_units(
-        prob_edge,
-        ev
-    )
-
-
-    st.divider()
-
-    st.subheader(
-        f"Result: {label}"
-    )
-
-
-    a, b, c, d = st.columns(4)
-
-
-    a.metric(
-        "Model Probability",
-        pct(model_prob)
-    )
-
-
-    b.metric(
-        "Break-even Probability",
-        pct(implied)
-    )
-
-
-    c.metric(
-        "Probability Edge",
-        f"{100 * prob_edge:+.1f}%"
-    )
-
-
-    d.metric(
-        "Grade",
-        grade
-    )
-
-
-    e1, e2 = st.columns(2)
-
-
-    e1.metric(
-        "EV per $1",
-        f"${ev:+.3f}"
-    )
-
-
-    e2.metric(
-        "Suggested Size",
-        f"{units:.1f}u"
-    )
-
-
-    if point_edge is not None:
-
-        st.metric(
-            "Model Line Cushion",
-            f"{point_edge:+.1f} pts"
-        )
-
-
-    if grade == "PASS":
-
-        st.info(
-            "PASS — the price does not "
-            "create enough estimated edge."
-        )
-
-
-    elif grade == "C":
-
-        st.warning(
-            "C-GRADE LEAN — small edge. "
-            "Usually wait for a better price."
-        )
-
-
-    elif grade == "B":
-
-        st.success(
-            "B-GRADE CANDIDATE — meaningful "
-            "model-versus-price edge."
-        )
-
-
-    else:
-
-        st.success(
-            "A-GRADE CANDIDATE — strong "
-            "model-versus-price discrepancy. "
-            "Verify injury news before betting."
-        )
-
-
-    st.caption(
-        "Probability estimates use a "
-        "football scoring distribution model."
-    )
-
+# =========================================================
+# DEVELOPMENT ROADMAP
+# =========================================================
 
 st.divider()
 
-
-# -----------------------------
-# COMPARE ALTERNATE LINES
-# -----------------------------
-
-st.header("3. Compare Alternate Lines")
-
-st.write(
-    "Enter several sportsbook options and "
-    "compare the line/price combinations."
-)
-
-
-compare_type = st.selectbox(
-    "Compare",
-    [
-        "Spreads",
-        "Totals"
-    ]
-)
-
-
-rows = []
-
-
-if compare_type == "Spreads":
-
-    compare_team = st.selectbox(
-        "Compare Team",
-        [
-            away_team,
-            home_team
-        ],
-        key="compare_team"
-    )
-
-
-    if (
-        compare_team == away_team
-        and model_margin_home < 0
-    ):
-
-        defaults = [
-            (-19.5, -250),
-            (-20.5, -190),
-            (-21.5, -150),
-            (-22.5, -110)
-        ]
-
-    else:
-
-        defaults = [
-            (3.5, -110),
-            (6.5, -150),
-            (9.5, -250),
-            (13.5, -500)
-        ]
-
-
-    for i in range(4):
-
-        c1, c2 = st.columns(2)
-
-
-        with c1:
-
-            test_line = (
-                st.number_input(
-                    f"Line {i + 1}",
-                    value=float(
-                        defaults[i][0]
-                    ),
-                    step=0.5,
-                    key=f"spread_line_{i}"
-                )
-            )
-
-
-        with c2:
-
-            test_odds = (
-                st.number_input(
-                    f"Odds {i + 1}",
-                    value=int(
-                        defaults[i][1]
-                    ),
-                    step=5,
-                    key=f"spread_odds_{i}"
-                )
-            )
-
-
-        p = spread_cover_probability(
-            model_margin_home,
-            compare_team,
-            test_line,
-            home_team,
-            away_team
-        )
-
-
-        implied = (
-            american_to_implied_prob(
-                int(test_odds)
-            )
-        )
-
-
-        prob_edge = (
-            p - implied
-        )
-
-
-        ev = expected_value_per_dollar(
-            p,
-            int(test_odds)
-        )
-
-
-        rows.append(
-            {
-                "Bet":
-                    f"{compare_team} "
-                    f"{test_line:+.1f}",
-
-                "Odds":
-                    int(test_odds),
-
-                "Model Prob":
-                    p,
-
-                "Break-even":
-                    implied,
-
-                "Prob Edge":
-                    prob_edge,
-
-                "EV/$1":
-                    ev,
-
-                "Grade":
-                    edge_grade(
-                        prob_edge
-                    )
-            }
-        )
-
-
-else:
-
-    compare_direction = (
-        st.selectbox(
-            "Direction",
-            [
-                "Over",
-                "Under"
-            ]
-        )
-    )
-
-
-    defaults = [
-        (41.5, -400),
-        (48.5, -180),
-        (54.5, -110),
-        (58.5, -110)
-    ]
-
-
-    for i in range(4):
-
-        c1, c2 = st.columns(2)
-
-
-        with c1:
-
-            test_line = (
-                st.number_input(
-                    f"Total {i + 1}",
-                    value=float(
-                        defaults[i][0]
-                    ),
-                    step=0.5,
-                    key=f"total_line_{i}"
-                )
-            )
-
-
-        with c2:
-
-            test_odds = (
-                st.number_input(
-                    f"Odds {i + 1}",
-                    value=int(
-                        defaults[i][1]
-                    ),
-                    step=5,
-                    key=f"total_odds_{i}"
-                )
-            )
-
-
-        p = total_probability(
-            model_total,
-            compare_direction,
-            test_line
-        )
-
-
-        implied = (
-            american_to_implied_prob(
-                int(test_odds)
-            )
-        )
-
-
-        prob_edge = (
-            p - implied
-        )
-
-
-        ev = expected_value_per_dollar(
-            p,
-            int(test_odds)
-        )
-
-
-        rows.append(
-            {
-                "Bet":
-                    f"{compare_direction} "
-                    f"{test_line:.1f}",
-
-                "Odds":
-                    int(test_odds),
-
-                "Model Prob":
-                    p,
-
-                "Break-even":
-                    implied,
-
-                "Prob Edge":
-                    prob_edge,
-
-                "EV/$1":
-                    ev,
-
-                "Grade":
-                    edge_grade(
-                        prob_edge
-                    )
-            }
-        )
-
-
-df = pd.DataFrame(rows)
-
-
-df["Model Prob"] = (
-    df["Model Prob"]
-    .map(
-        lambda x:
-        f"{100 * x:.1f}%"
-    )
-)
-
-
-df["Break-even"] = (
-    df["Break-even"]
-    .map(
-        lambda x:
-        f"{100 * x:.1f}%"
-    )
-)
-
-
-df["Prob Edge"] = (
-    df["Prob Edge"]
-    .map(
-        lambda x:
-        f"{100 * x:+.1f}%"
-    )
-)
-
-
-df["EV/$1"] = (
-    df["EV/$1"]
-    .map(
-        lambda x:
-        f"${x:+.3f}"
-    )
-)
-
-
-st.dataframe(
-    df,
-    use_container_width=True,
-    hide_index=True
-)
-
-
-st.divider()
-
-
-# -----------------------------
-# ROADMAP
-# -----------------------------
-
-st.header("4. Matchup Edge Roadmap")
+st.header("🚀 Matchup Edge Roadmap")
 
 st.markdown(
     """
-    Future automatic features:
+**V3A — LIVE NOW**
+- Automatic 2026 FBS schedule
+- Week selector
+- Game selector
+- Secure CFBD connection
 
-    - Live game schedule
-    - Sportsbook odds
-    - Alternate spreads
-    - Alternate totals
-    - Injury reports
-    - Rosters and depth charts
-    - QB efficiency
-    - Offensive line metrics
-    - Defensive front metrics
-    - Explosive-play rates
-    - Team efficiency
-    - Weather
-    - Travel and rest
-    - Line movement
-    - Closing-line value tracking
-    - Historical model performance
-    """
+**V3B — NEXT**
+- Automatic team statistics
+- Game results
+- Rolling power ratings
+- Offensive and defensive efficiency
+- Recent form
+- Strength of schedule
+- Automatic fair spread
+- Automatic fair total
+
+**V3C**
+- Rosters
+- Quarterback evaluation
+- Offensive line / defensive front
+- Skill-position strength
+- Injury adjustments
+
+**V3D**
+- Sportsbook odds
+- Alternate spreads and totals
+- Line movement
+- Price comparison
+
+**V3E**
+- Prediction history
+- Closing line value
+- Bet results
+- Model calibration
+"""
 )
 
 
+st.divider()
+
 st.caption(
-    "Matchup Edge v2 • "
-    "Matchup Model → Test Line → "
-    "Calculate EV → Bet / Pass"
+    "Matchup Edge V3A • Live Schedule → "
+    "Automatic Matchup Data → Line Testing"
 )
