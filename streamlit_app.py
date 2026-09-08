@@ -488,3 +488,102 @@ st.caption(
     "Matchup Edge V3A • Live Schedule → "
     "Automatic Matchup Data → Line Testing"
 )
+# =========================================================
+# V3B — AUTOMATIC TEAM DATA TEST
+# =========================================================
+
+st.divider()
+st.header("📊 V3B — Automatic Team Data Test")
+
+@st.cache_data(ttl=3600)
+def get_team_records(year, week, api_key):
+    return cfbd_get(
+        "/records",
+        {
+            "year": year,
+            "week": week,
+        },
+        api_key,
+    )
+
+
+try:
+    records = get_team_records(
+        season,
+        week,
+        CFBD_API_KEY,
+    )
+
+    record_lookup = {}
+
+    for record in records:
+        team_name = get_field(
+            record,
+            "team",
+            default="",
+        )
+
+        total_record = get_field(
+            record,
+            "total",
+            default={},
+        )
+
+        wins = get_field(
+            total_record,
+            "wins",
+            default=0,
+        )
+
+        losses = get_field(
+            total_record,
+            "losses",
+            default=0,
+        )
+
+        record_lookup[team_name] = {
+            "wins": wins,
+            "losses": losses,
+        }
+
+
+    away_record = record_lookup.get(
+        away_team,
+        {"wins": 0, "losses": 0},
+    )
+
+    home_record = record_lookup.get(
+        home_team,
+        {"wins": 0, "losses": 0},
+    )
+
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader(away_team)
+        st.metric(
+            "Record",
+            f"{away_record['wins']}-{away_record['losses']}",
+        )
+
+    with col2:
+        st.subheader(home_team)
+        st.metric(
+            "Record",
+            f"{home_record['wins']}-{home_record['losses']}",
+        )
+
+
+    st.success(
+        "Automatic team-data connection is working."
+    )
+
+
+except Exception as error:
+    st.error(
+        "Schedule works, but the V3B team-data test "
+        "could not load."
+    )
+
+    st.code(str(error))
