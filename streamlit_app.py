@@ -1607,3 +1607,131 @@ st.caption(
     "Matchup Edge V4 • "
     "Data → Matchup → Fair Line → Price → EV"
 )
+
+
+# =========================================================
+# V5 API ACCESS DIAGNOSTIC
+# =========================================================
+
+st.divider()
+st.header("🧪 V5 Data Access Test")
+
+def test_cfbd_endpoint(name, path, params):
+    try:
+        data = cfbd_get(
+            path,
+            params,
+            CFBD_API_KEY,
+        )
+
+        if isinstance(data, list):
+            count = len(data)
+        else:
+            count = 1 if data else 0
+
+        return {
+            "Source": name,
+            "Status": "✅ WORKING",
+            "Records": count,
+            "Error": "",
+        }
+
+    except Exception as error:
+        return {
+            "Source": name,
+            "Status": "❌ BLOCKED / ERROR",
+            "Records": 0,
+            "Error": str(error),
+        }
+
+
+tests = []
+
+tests.append(
+    test_cfbd_endpoint(
+        "CORE",
+        "/ratings/core",
+        {
+            "year": 2026,
+        },
+    )
+)
+
+tests.append(
+    test_cfbd_endpoint(
+        "SP+",
+        "/ratings/sp",
+        {
+            "year": 2026,
+        },
+    )
+)
+
+tests.append(
+    test_cfbd_endpoint(
+        "Elo",
+        "/ratings/elo",
+        {
+            "year": 2026,
+            "week": max(1, week - 1),
+            "seasonType": "regular",
+        },
+    )
+)
+
+tests.append(
+    test_cfbd_endpoint(
+        "SRS",
+        "/ratings/srs",
+        {
+            "year": 2026,
+        },
+    )
+)
+
+tests.append(
+    test_cfbd_endpoint(
+        "FPI",
+        "/ratings/fpi",
+        {
+            "year": 2026,
+        },
+    )
+)
+
+
+test_df = pd.DataFrame(tests)
+
+st.dataframe(
+    test_df,
+    use_container_width=True,
+    hide_index=True,
+)
+
+
+working_count = sum(
+    1
+    for test in tests
+    if test["Status"] == "✅ WORKING"
+)
+
+
+if working_count >= 3:
+    st.success(
+        f"{working_count}/5 advanced rating "
+        "sources are accessible. "
+        "We have enough to build V5."
+    )
+
+elif working_count >= 1:
+    st.warning(
+        f"{working_count}/5 advanced rating "
+        "sources are accessible. "
+        "V5 can use the available sources."
+    )
+
+else:
+    st.error(
+        "None of the advanced rating sources "
+        "are accessible with this API key."
+    )
