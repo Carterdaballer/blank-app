@@ -1,37 +1,51 @@
 import math
 import json
+import statistics
 import urllib.parse
 import urllib.request
-from collections import defaultdict
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
 
 # =========================================================
-# PAGE SETUP
+# PAGE CONFIG
 # =========================================================
 
 st.set_page_config(
-    page_title="Matchup Edge V4",
+    page_title="Matchup Edge V5",
     page_icon="🏈",
     layout="wide",
 )
 
-st.title("🏈 Matchup Edge V4")
+st.title("🏈 Matchup Edge V5")
 st.caption(
-    "College Football Matchup Model • "
-    "Power Ratings • Fair Lines • EV Analysis"
-)
-
-st.warning(
-    "For research and entertainment only. "
-    "Model probabilities are estimates, not guarantees."
+    "Independent college-football matchup model • "
+    "Consensus ratings → matchup → fair line → price → EV"
 )
 
 
 # =========================================================
-# CFBD CONNECTION
+# SETTINGS
+# =========================================================
+
+SEASON = 2026
+PREVIOUS_SEASON = 2025
+
+HOME_FIELD_ADVANTAGE = 2.5
+
+SPREAD_SIGMA = 13.5
+TOTAL_SIGMA = 14.0
+ML_LOGISTIC_SCALE = 6.5
+
+# Approximate number of spread-points represented by
+# one national standard deviation of team strength.
+RATING_SD_POINTS = 7.5
+
+
+# =========================================================
+# API KEY
 # =========================================================
 
 try:
@@ -43,16 +57,26 @@ except Exception:
     st.stop()
 
 
-@st.cache_data(ttl=3600)
-def cfbd_get(path, params, api_key):
-    query_string = urllib.parse.urlencode(params)
+# =========================================================
+# CFBD REQUEST FUNCTION
+# =========================================================
 
-    url = (
-        "https://api.collegefootballdata.com"
-        + path
-        + "?"
-        + query_string
-    )
+@st.cache_data(ttl=3600, show_spinner=False)
+def cfbd_get(path, params, api_key):
+    base_url = "https://api.collegefootballdata.com"
+
+    clean_params = {
+        key: value
+        for key, value in params.items()
+        if value is not None
+    }
+
+    query = urllib.parse.urlencode(clean_params)
+
+    url = f"{base_url}{path}"
+
+    if query:
+        url += f"?{query}"
 
     request = urllib.request.Request(
         url,
@@ -64,19 +88,59 @@ def cfbd_get(path, params, api_key):
 
     with urllib.request.urlopen(
         request,
-        timeout=25,
+        timeout=30,
     ) as response:
         return json.loads(
             response.read().decode("utf-8")
         )
 
 
-def get_field(data, *names, default=None):
-    for name in names:
-        if name in data and data[name] is not None:
-            return data[name]
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def safe_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value, default=None):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def first_value(dictionary, *keys, default=None):
+    for key in keys:
+        if key in dictionary:
+            value = dictionary.get(key)
+
+            if value is not None:
+                return value
 
     return default
+
+
+def normal_cdf(x):
+    return 0.5 * (
+        1.0
+        + math.erf(
+            x / math.sqrt(2.0)
+        )
+    )
+
+
+def logistic(x):
+    return 1.0 / (
+        1.0 + math.exp(-x)
+    )
 
 
 # =========================================================
@@ -84,82 +148,238 @@ def get_field(data, *names, default=None):
 # =========================================================
 
 def american_to_decimal(odds):
-    if odds > 0:
-        return 1 + odds / 100
+    odds = float(odds)
 
-    return 1 + 100 / abs(odds)
+    if odds > 0:
+        return 1.0 + odds / 100.0
+
+    return 1.0 + 100.0 / abs(odds)
 
 
 def implied_probability(odds):
-    if odds > 0:
-        return 100 / (odds + 100)
-
-    return abs(odds) / (
-        abs(odds) + 100
-    )
+    return 1.0 / american_to_decimal(odds)
 
 
-def normal_cdf(x):
-    return 0.5 * (
-        1 + math.erf(
-            x / math.sqrt(2)
-        )
-    )
-
-
-def expected_value(model_prob, odds):
-    decimal = american_to_decimal(odds)
-
-    profit = decimal - 1
+def expected_value(probability, odds):
+    decimal_odds = american_to_decimal(odds)
 
     return (
-        model_prob * profit
-        - (1 - model_prob)
+        probability * (decimal_odds - 1.0)
+        - (1.0 - probability)
     )
 
 
-def edge_grade(prob_edge, ev):
+def edge_grade(probability_edge, ev):
     if ev <= 0:
         return "PASS"
 
-    if prob_edge >= 0.08:
+    if probability_edge >= 0.08:
         return "A"
 
-    if prob_edge >= 0.04:
+    if probability_edge >= 0.04:
         return "B"
 
-    if prob_edge >= 0.015:
+    if probability_edge >= 0.015:
         return "C"
 
     return "PASS"
 
 
-def suggested_units(prob_edge, ev):
-    if ev <= 0 or prob_edge < 0.015:
+def suggested_units(probability_edge, ev, confidence):
+    if ev <= 0:
         return 0.0
 
-    if prob_edge < 0.04:
-        return 0.5
+    if probability_edge < 0.015:
+        return 0.0
 
-    if prob_edge < 0.08:
-        return 1.0
+    if probability_edge < 0.04:
+        units = 0.5
 
-    if prob_edge < 0.12:
-        return 1.5
+    elif probability_edge < 0.08:
+        units = 1.0
 
-    return 2.0
+    elif probability_edge < 0.12:
+        units = 1.5
+
+    else:
+        units = 2.0
+
+    # Early-season / low-confidence protection
+    if confidence < 55:
+        units = min(units, 0.5)
+
+    elif confidence < 65:
+        units = min(units, 1.0)
+
+    return units
+
+
+# =========================================================
+# TEAM NAME NORMALIZATION
+# =========================================================
+
+def normalize_team_name(name):
+    if name is None:
+        return ""
+
+    return (
+        str(name)
+        .strip()
+        .lower()
+        .replace("&", "and")
+        .replace(".", "")
+        .replace("'", "")
+    )
+
+
+def make_team_lookup(rows):
+    lookup = {}
+
+    for row in rows:
+        team = first_value(
+            row,
+            "team",
+            "school",
+        )
+
+        if team:
+            lookup[
+                normalize_team_name(team)
+            ] = row
+
+    return lookup
+
+
+def find_team_row(lookup, team):
+    key = normalize_team_name(team)
+
+    if key in lookup:
+        return lookup[key]
+
+    # Conservative fallback
+    for stored_key, row in lookup.items():
+        if (
+            key == stored_key
+            or key in stored_key
+            or stored_key in key
+        ):
+            return row
+
+    return None
+
+
+# =========================================================
+# STANDARDIZATION
+# =========================================================
+
+def zscore_map(rows, value_getter):
+    values = []
+
+    team_values = {}
+
+    for row in rows:
+        team = first_value(
+            row,
+            "team",
+            "school",
+        )
+
+        value = value_getter(row)
+
+        value = safe_float(value)
+
+        if team and value is not None:
+            team_values[
+                normalize_team_name(team)
+            ] = value
+
+            values.append(value)
+
+    if len(values) < 5:
+        return {}
+
+    mean_value = statistics.mean(values)
+
+    try:
+        sd_value = statistics.stdev(values)
+    except statistics.StatisticsError:
+        return {}
+
+    if sd_value == 0:
+        return {}
+
+    return {
+        team: (
+            (value - mean_value)
+            / sd_value
+        )
+        for team, value in team_values.items()
+    }
+
+
+def z_to_points(z):
+    if z is None:
+        return None
+
+    return z * RATING_SD_POINTS
+
+
+# =========================================================
+# RATING ENDPOINTS
+# =========================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_sp(year, api_key):
+    return cfbd_get(
+        "/ratings/sp",
+        {
+            "year": year,
+        },
+        api_key,
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_fpi(year, api_key):
+    return cfbd_get(
+        "/ratings/fpi",
+        {
+            "year": year,
+        },
+        api_key,
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_core(year, api_key):
+    return cfbd_get(
+        "/ratings/core",
+        {
+            "year": year,
+        },
+        api_key,
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_elo(year, week, api_key):
+    return cfbd_get(
+        "/ratings/elo",
+        {
+            "year": year,
+            "week": week,
+            "seasonType": "regular",
+        },
+        api_key,
+    )
 
 
 # =========================================================
 # SCHEDULE
 # =========================================================
 
-@st.cache_data(ttl=3600)
-def get_week_games(
-    year,
-    week,
-    api_key,
-):
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_week_games(year, week, api_key):
     return cfbd_get(
         "/games",
         {
@@ -172,225 +392,88 @@ def get_week_games(
     )
 
 
-st.divider()
-st.header("📅 Select Matchup")
+# =========================================================
+# PRIOR GAME HISTORY
+# =========================================================
 
-season = st.selectbox(
-    "Season",
-    [2026],
-)
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_prior_games(year, selected_week, api_key):
+    all_games = {}
 
-week = st.selectbox(
-    "Week",
-    list(range(0, 17)),
-    index=2,
-)
+    for game_week in range(
+        0,
+        selected_week,
+    ):
+        try:
+            games = cfbd_get(
+                "/games",
+                {
+                    "year": year,
+                    "week": game_week,
+                    "seasonType": "regular",
+                },
+                api_key,
+            )
 
+            for game in games:
+                game_id = first_value(
+                    game,
+                    "id",
+                    "gameId",
+                )
 
-try:
-    schedule = get_week_games(
-        season,
-        week,
-        CFBD_API_KEY,
-    )
+                if game_id is not None:
+                    all_games[str(game_id)] = game
 
-except Exception as error:
-    st.error(
-        "The 2026 schedule could not be loaded."
-    )
-    st.code(str(error))
-    st.stop()
+        except Exception:
+            continue
 
-
-if not schedule:
-    st.info(
-        f"No games were returned for Week {week}."
-    )
-    st.stop()
-
-
-games = []
-
-for game in schedule:
-    away = get_field(
-        game,
-        "awayTeam",
-        "away_team",
-        default="Away",
-    )
-
-    home = get_field(
-        game,
-        "homeTeam",
-        "home_team",
-        default="Home",
-    )
-
-    start_date = get_field(
-        game,
-        "startDate",
-        "start_date",
-        default="",
-    )
-
-    venue = get_field(
-        game,
-        "venue",
-        default="",
-    )
-
-    neutral_site = get_field(
-        game,
-        "neutralSite",
-        "neutral_site",
-        default=False,
-    )
-
-    games.append(
-        {
-            "away": away,
-            "home": home,
-            "start_date": start_date,
-            "venue": venue,
-            "neutral_site": neutral_site,
-        }
-    )
-
-
-game_labels = [
-    f"{g['away']} @ {g['home']}"
-    for g in games
-]
-
-selected_label = st.selectbox(
-    "Game",
-    game_labels,
-)
-
-selected_game = games[
-    game_labels.index(selected_label)
-]
-
-away_team = selected_game["away"]
-home_team = selected_game["home"]
-
-st.subheader(
-    f"{away_team} @ {home_team}"
-)
-
-if selected_game["start_date"]:
-    st.write(
-        f"**Kickoff:** "
-        f"{selected_game['start_date']}"
-    )
-
-if selected_game["venue"]:
-    st.write(
-        f"**Venue:** "
-        f"{selected_game['venue']}"
-    )
-
-if selected_game["neutral_site"]:
-    st.write("**Site:** Neutral")
+    return list(all_games.values())
 
 
 # =========================================================
-# LOAD ALL PRIOR GAMES
+# TEAM GAME METRICS
 # =========================================================
 
-@st.cache_data(ttl=3600)
-def get_prior_games(
-    year,
-    selected_week,
-    api_key,
-):
-    all_games = []
+def build_team_game_metrics(games):
+    metrics = {}
 
-    for w in range(0, selected_week):
-        week_games = cfbd_get(
-            "/games",
-            {
-                "year": year,
-                "week": w,
-                "seasonType": "regular",
-            },
-            api_key,
-        )
+    def ensure_team(team):
+        if team not in metrics:
+            metrics[team] = {
+                "games": 0,
+                "points_for": [],
+                "points_against": [],
+                "margins": [],
+            }
 
-        all_games.extend(
-            week_games
-        )
-
-    return all_games
-
-
-try:
-    raw_prior_games = get_prior_games(
-        season,
-        week,
-        CFBD_API_KEY,
-    )
-
-except Exception as error:
-    st.error(
-        "Previous game results could not be loaded."
-    )
-    st.code(str(error))
-    st.stop()
-
-
-# =========================================================
-# BUILD TEAM RESULTS
-# =========================================================
-
-def build_team_results(raw_games):
-    results = defaultdict(list)
-
-    seen_ids = set()
-
-    for game in raw_games:
-        game_id = get_field(
-            game,
-            "id",
-            default=None,
-        )
-
-        if game_id is not None:
-            if game_id in seen_ids:
-                continue
-
-            seen_ids.add(game_id)
-
-        game_week = get_field(
-            game,
-            "week",
-            default=0,
-        )
-
-        home = get_field(
+    for game in games:
+        home = first_value(
             game,
             "homeTeam",
             "home_team",
-            default="",
         )
 
-        away = get_field(
+        away = first_value(
             game,
             "awayTeam",
             "away_team",
-            default="",
         )
 
-        home_points = get_field(
-            game,
-            "homePoints",
-            "home_points",
+        home_points = safe_float(
+            first_value(
+                game,
+                "homePoints",
+                "home_points",
+            )
         )
 
-        away_points = get_field(
-            game,
-            "awayPoints",
-            "away_points",
+        away_points = safe_float(
+            first_value(
+                game,
+                "awayPoints",
+                "away_points",
+            )
         )
 
         if (
@@ -401,363 +484,800 @@ def build_team_results(raw_games):
         ):
             continue
 
-        home_margin = (
+        ensure_team(home)
+        ensure_team(away)
+
+        metrics[home]["games"] += 1
+        metrics[home]["points_for"].append(
+            home_points
+        )
+        metrics[home]["points_against"].append(
+            away_points
+        )
+        metrics[home]["margins"].append(
             home_points - away_points
         )
 
-        away_margin = -home_margin
-
-        results[home].append(
-            {
-                "week": game_week,
-                "opponent": away,
-                "pf": home_points,
-                "pa": away_points,
-                "margin": home_margin,
-                "location": "Home",
-            }
+        metrics[away]["games"] += 1
+        metrics[away]["points_for"].append(
+            away_points
+        )
+        metrics[away]["points_against"].append(
+            home_points
+        )
+        metrics[away]["margins"].append(
+            away_points - home_points
         )
 
-        results[away].append(
-            {
-                "week": game_week,
-                "opponent": home,
-                "pf": away_points,
-                "pa": home_points,
-                "margin": away_margin,
-                "location": "Away",
-            }
-        )
-
-    return results
+    return metrics
 
 
-team_results = build_team_results(
-    raw_prior_games
-)
-
-
-# =========================================================
-# RECENCY WEIGHTING
-# =========================================================
-
-def recency_weight(
-    game_week,
-    selected_week,
-):
-    weeks_ago = max(
-        1,
-        selected_week - game_week,
-    )
-
-    return 0.88 ** (
-        weeks_ago - 1
-    )
-
-
-def weighted_average(
-    values,
-    weights,
-):
+def average(values, default=0.0):
     if not values:
-        return 0.0
+        return default
 
-    total_weight = sum(weights)
-
-    if total_weight == 0:
-        return 0.0
-
-    return sum(
-        value * weight
-        for value, weight
-        in zip(values, weights)
-    ) / total_weight
+    return sum(values) / len(values)
 
 
-# =========================================================
-# RAW TEAM PERFORMANCE
-# =========================================================
-
-def raw_team_metrics(
-    team,
-    results,
-    selected_week,
-):
-    games_list = results.get(
+def team_game_summary(metrics, team):
+    data = metrics.get(
         team,
-        [],
-    )
-
-    if not games_list:
-        return {
+        {
             "games": 0,
-            "margin": 0.0,
-            "offense": 0.0,
-            "defense": 0.0,
-        }
-
-    margins = []
-    points_for = []
-    points_against = []
-    weights = []
-
-    for game in games_list:
-        weight = recency_weight(
-            game["week"],
-            selected_week,
-        )
-
-        margins.append(
-            game["margin"]
-        )
-
-        points_for.append(
-            game["pf"]
-        )
-
-        points_against.append(
-            game["pa"]
-        )
-
-        weights.append(weight)
+            "points_for": [],
+            "points_against": [],
+            "margins": [],
+        },
+    )
 
     return {
-        "games": len(games_list),
-
-        "margin": weighted_average(
-            margins,
-            weights,
+        "games": data["games"],
+        "ppg": average(
+            data["points_for"],
+            0.0,
         ),
-
-        "offense": weighted_average(
-            points_for,
-            weights,
+        "pa": average(
+            data["points_against"],
+            0.0,
         ),
-
-        "defense": weighted_average(
-            points_against,
-            weights,
+        "margin": average(
+            data["margins"],
+            0.0,
         ),
     }
 
 
 # =========================================================
-# OPPONENT-ADJUSTED RATINGS
+# RATING VALUE EXTRACTORS
 # =========================================================
 
-def calculate_adjusted_ratings(
-    results,
-    selected_week,
-):
-    ratings = {}
+def sp_rating(row):
+    return safe_float(
+        first_value(
+            row,
+            "rating",
+        )
+    )
 
-    for team in results:
-        metrics = raw_team_metrics(
-            team,
-            results,
-            selected_week,
+
+def fpi_rating(row):
+    return safe_float(
+        first_value(
+            row,
+            "fpi",
+        )
+    )
+
+
+def elo_rating(row):
+    return safe_float(
+        first_value(
+            row,
+            "elo",
+        )
+    )
+
+
+def core_rating(row):
+    return safe_float(
+        first_value(
+            row,
+            "overall",
+        )
+    )
+
+
+# =========================================================
+# SP+ COMPONENT HELPERS
+# =========================================================
+
+def nested_rating(row, section):
+    if not row:
+        return None
+
+    data = row.get(section)
+
+    if not isinstance(data, dict):
+        return None
+
+    return safe_float(
+        data.get("rating")
+    )
+
+
+def nested_value(row, section, field):
+    if not row:
+        return None
+
+    data = row.get(section)
+
+    if not isinstance(data, dict):
+        return None
+
+    return safe_float(
+        data.get(field)
+    )
+
+
+# =========================================================
+# FPI COMPONENT HELPERS
+# =========================================================
+
+def fpi_efficiency(row, field):
+    if not row:
+        return None
+
+    efficiencies = row.get(
+        "efficiencies"
+    )
+
+    if not isinstance(
+        efficiencies,
+        dict,
+    ):
+        return None
+
+    return safe_float(
+        efficiencies.get(field)
+    )
+
+
+# =========================================================
+# CORE FRESHNESS
+# =========================================================
+
+def valid_core_rows(rows, selected_week):
+    valid = []
+
+    for row in rows:
+        through_week = safe_int(
+            first_value(
+                row,
+                "throughWeek",
+                "through_week",
+            ),
+            default=-1,
         )
 
-        ratings[team] = metrics[
-            "margin"
-        ]
+        # Strict anti-leakage rule:
+        # only use CORE if its snapshot ends
+        # BEFORE the selected game week.
+        if through_week < selected_week:
+            valid.append(row)
 
-    for _ in range(10):
-        new_ratings = {}
-
-        for team, games_list in results.items():
-            performances = []
-            weights = []
-
-            for game in games_list:
-                opponent_rating = ratings.get(
-                    game["opponent"],
-                    0.0,
-                )
-
-                performance = (
-                    game["margin"]
-                    + opponent_rating
-                )
-
-                weight = recency_weight(
-                    game["week"],
-                    selected_week,
-                )
-
-                performances.append(
-                    performance
-                )
-
-                weights.append(
-                    weight
-                )
-
-            new_ratings[team] = weighted_average(
-                performances,
-                weights,
-            )
-
-        if new_ratings:
-            center = (
-                sum(new_ratings.values())
-                / len(new_ratings)
-            )
-
-            ratings = {
-                team: rating - center
-                for team, rating
-                in new_ratings.items()
-            }
-
-    return ratings
-
-
-adjusted_ratings = (
-    calculate_adjusted_ratings(
-        team_results,
-        week,
-    )
-)
+    return valid
 
 
 # =========================================================
-# EARLY-SEASON STABILIZATION
+# NATIONAL RATING MAPS
 # =========================================================
 
-def stabilized_rating(
-    team,
-    adjusted_ratings,
-    results,
+def build_rating_maps(
+    sp_rows,
+    fpi_rows,
+    elo_rows,
+    core_rows,
 ):
-    current_rating = adjusted_ratings.get(
-        team,
-        0.0,
+    return {
+        "SP+": zscore_map(
+            sp_rows,
+            sp_rating,
+        ),
+        "FPI": zscore_map(
+            fpi_rows,
+            fpi_rating,
+        ),
+        "Elo": zscore_map(
+            elo_rows,
+            elo_rating,
+        ),
+        "CORE": zscore_map(
+            core_rows,
+            core_rating,
+        ),
+    }
+
+
+# =========================================================
+# CONSENSUS TEAM STRENGTH
+# =========================================================
+
+def consensus_from_maps(
+    team,
+    maps,
+    source_weights,
+):
+    key = normalize_team_name(team)
+
+    components = []
+
+    for source, weight in source_weights.items():
+        source_map = maps.get(
+            source,
+            {},
+        )
+
+        z = source_map.get(key)
+
+        if z is not None:
+            components.append(
+                (
+                    source,
+                    z_to_points(z),
+                    weight,
+                )
+            )
+
+    if not components:
+        return 0.0, []
+
+    total_weight = sum(
+        item[2]
+        for item in components
     )
 
-    games_played = len(
-        results.get(team, [])
+    rating = sum(
+        item[1] * item[2]
+        for item in components
+    ) / total_weight
+
+    return rating, components
+
+
+# =========================================================
+# SEASON BLEND
+# =========================================================
+
+def current_season_weight(week):
+    # Week 1 remains mostly prior-driven.
+    # Current-season data gradually takes over.
+    weight = 0.15 + 0.10 * max(
+        0,
+        week - 1,
     )
 
-    # Early-season shrinkage toward average.
-    # As more games are played, the team's actual
-    # 2026 results receive progressively more weight.
-    current_weight = min(
+    return min(
         0.85,
-        0.25 + (
-            0.10 * games_played
+        max(
+            0.15,
+            weight,
         ),
     )
 
-    prior_rating = 0.0
 
-    final_rating = (
-        current_weight
-        * current_rating
-        + (
-            1 - current_weight
-        )
-        * prior_rating
-    )
-
+def blend_team_strength(
+    prior_rating,
+    current_rating,
+    current_weight,
+):
     return (
-        final_rating,
-        current_weight,
+        prior_rating
+        * (1.0 - current_weight)
+        + current_rating
+        * current_weight
     )
-
-
-away_rating, away_current_weight = (
-    stabilized_rating(
-        away_team,
-        adjusted_ratings,
-        team_results,
-    )
-)
-
-home_rating, home_current_weight = (
-    stabilized_rating(
-        home_team,
-        adjusted_ratings,
-        team_results,
-    )
-)
 
 
 # =========================================================
-# OFFENSE / DEFENSE
+# DISAGREEMENT / CONFIDENCE
 # =========================================================
 
-away_metrics = raw_team_metrics(
-    away_team,
-    team_results,
-    week,
-)
-
-home_metrics = raw_team_metrics(
-    home_team,
-    team_results,
-    week,
-)
+def component_values(components):
+    return [
+        item[1]
+        for item in components
+    ]
 
 
-all_pf = []
+def source_disagreement(
+    away_components,
+    home_components,
+):
+    away_dict = {
+        name: value
+        for name, value, weight
+        in away_components
+    }
 
-for team, games_list in team_results.items():
-    for game in games_list:
-        all_pf.append(
-            game["pf"]
+    home_dict = {
+        name: value
+        for name, value, weight
+        in home_components
+    }
+
+    differences = []
+
+    for source in set(
+        away_dict.keys()
+    ).intersection(
+        home_dict.keys()
+    ):
+        differences.append(
+            home_dict[source]
+            - away_dict[source]
         )
 
+    if len(differences) < 2:
+        return 6.0
 
-if all_pf:
-    national_scoring_average = (
-        sum(all_pf) / len(all_pf)
+    try:
+        return statistics.stdev(
+            differences
+        )
+    except statistics.StatisticsError:
+        return 6.0
+
+
+def calculate_confidence(
+    week,
+    games_away,
+    games_home,
+    disagreement,
+    source_count,
+):
+    sample_games = min(
+        games_away,
+        games_home,
     )
-else:
-    national_scoring_average = 27.0
 
+    confidence = 50.0
+
+    confidence += min(
+        15.0,
+        sample_games * 4.0,
+    )
+
+    confidence += min(
+        10.0,
+        source_count * 2.0,
+    )
+
+    confidence -= min(
+        15.0,
+        disagreement * 1.5,
+    )
+
+    if week <= 2:
+        confidence -= 5.0
+
+    return max(
+        35,
+        min(
+            85,
+            round(confidence),
+        ),
+    )
+
+
+# =========================================================
+# FAIR TOTAL ENGINE
+# =========================================================
 
 def stabilized_scoring(
-    value,
+    observed,
     games_played,
     national_average,
 ):
+    if games_played <= 0:
+        return national_average
+
     sample_weight = min(
         0.80,
-        0.25 + (
-            0.10 * games_played
-        ),
+        games_played * 0.12,
     )
 
     return (
-        sample_weight * value
-        + (1 - sample_weight)
-        * national_average
+        observed * sample_weight
+        + national_average
+        * (1.0 - sample_weight)
     )
 
 
-away_offense = stabilized_scoring(
-    away_metrics["offense"],
-    away_metrics["games"],
-    national_scoring_average,
+def calculate_national_scoring_average(
+    metrics,
+):
+    scores = []
+
+    for team_data in metrics.values():
+        scores.extend(
+            team_data["points_for"]
+        )
+
+    if not scores:
+        return 27.5
+
+    return average(
+        scores,
+        27.5,
+    )
+
+
+# =========================================================
+# GAME LABEL
+# =========================================================
+
+def game_label(game):
+    away = first_value(
+        game,
+        "awayTeam",
+        "away_team",
+        default="Away",
+    )
+
+    home = first_value(
+        game,
+        "homeTeam",
+        "home_team",
+        default="Home",
+    )
+
+    return f"{away} @ {home}"
+
+
+# =========================================================
+# WEEK SELECTOR
+# =========================================================
+
+st.sidebar.header("Game Selection")
+
+week = st.sidebar.selectbox(
+    "Week",
+    list(range(0, 17)),
+    index=2,
 )
 
-away_defense_allowed = stabilized_scoring(
-    away_metrics["defense"],
-    away_metrics["games"],
-    national_scoring_average,
+
+# =========================================================
+# LOAD SCHEDULE
+# =========================================================
+
+try:
+    with st.spinner(
+        "Loading 2026 schedule..."
+    ):
+        week_games = get_week_games(
+            SEASON,
+            week,
+            CFBD_API_KEY,
+        )
+
+except Exception as error:
+    st.error(
+        "Could not load the CFBD schedule."
+    )
+    st.code(str(error))
+    st.stop()
+
+
+if not week_games:
+    st.warning(
+        f"No FBS games were returned for Week {week}."
+    )
+    st.stop()
+
+
+selected_game = st.sidebar.selectbox(
+    "Game",
+    week_games,
+    format_func=game_label,
 )
 
-home_offense = stabilized_scoring(
-    home_metrics["offense"],
-    home_metrics["games"],
-    national_scoring_average,
+
+# =========================================================
+# SELECTED GAME
+# =========================================================
+
+away_team = first_value(
+    selected_game,
+    "awayTeam",
+    "away_team",
+    default="Away",
 )
 
-home_defense_allowed = stabilized_scoring(
-    home_metrics["defense"],
-    home_metrics["games"],
-    national_scoring_average,
+home_team = first_value(
+    selected_game,
+    "homeTeam",
+    "home_team",
+    default="Home",
+)
+
+neutral_site = bool(
+    first_value(
+        selected_game,
+        "neutralSite",
+        "neutral_site",
+        default=False,
+    )
+)
+
+venue = first_value(
+    selected_game,
+    "venue",
+    default="Unknown venue",
+)
+
+start_date = first_value(
+    selected_game,
+    "startDate",
+    "start_date",
+    default="Unknown kickoff",
+)
+
+home_points = safe_float(
+    first_value(
+        selected_game,
+        "homePoints",
+        "home_points",
+    )
+)
+
+away_points = safe_float(
+    first_value(
+        selected_game,
+        "awayPoints",
+        "away_points",
+    )
+)
+
+
+st.header(
+    f"{away_team} at {home_team}"
+)
+
+game_col1, game_col2, game_col3 = st.columns(3)
+
+game_col1.metric(
+    "Week",
+    week,
+)
+
+game_col2.metric(
+    "Venue",
+    venue,
+)
+
+game_col3.metric(
+    "Site",
+    "Neutral"
+    if neutral_site
+    else f"{home_team} home",
+)
+
+st.caption(
+    f"Kickoff: {start_date}"
+)
+
+
+if (
+    home_points is not None
+    and away_points is not None
+):
+    st.warning(
+        "This game already has a recorded score. "
+        "Current-season snapshot ratings may contain "
+        "information unavailable before kickoff. "
+        "Use V5 primarily for upcoming games until "
+        "historical snapshots are fully implemented."
+    )
+
+
+# =========================================================
+# LOAD MODEL DATA
+# =========================================================
+
+try:
+    with st.spinner(
+        "Building V5 consensus model..."
+    ):
+
+        # -------------------------
+        # 2025 established prior
+        # -------------------------
+
+        prior_sp = get_sp(
+            PREVIOUS_SEASON,
+            CFBD_API_KEY,
+        )
+
+        prior_fpi = get_fpi(
+            PREVIOUS_SEASON,
+            CFBD_API_KEY,
+        )
+
+        # Late-season Elo snapshot
+        prior_elo = get_elo(
+            PREVIOUS_SEASON,
+            16,
+            CFBD_API_KEY,
+        )
+
+        try:
+            prior_core_all = get_core(
+                PREVIOUS_SEASON,
+                CFBD_API_KEY,
+            )
+        except Exception:
+            prior_core_all = []
+
+        prior_maps = build_rating_maps(
+            prior_sp,
+            prior_fpi,
+            prior_elo,
+            prior_core_all,
+        )
+
+        # -------------------------
+        # 2026 current information
+        # -------------------------
+
+        current_sp = get_sp(
+            SEASON,
+            CFBD_API_KEY,
+        )
+
+        current_fpi = get_fpi(
+            SEASON,
+            CFBD_API_KEY,
+        )
+
+        elo_week = max(
+            1,
+            week - 1,
+        )
+
+        current_elo = get_elo(
+            SEASON,
+            elo_week,
+            CFBD_API_KEY,
+        )
+
+        current_core_all = get_core(
+            SEASON,
+            CFBD_API_KEY,
+        )
+
+        current_core = valid_core_rows(
+            current_core_all,
+            week,
+        )
+
+        current_maps = build_rating_maps(
+            current_sp,
+            current_fpi,
+            current_elo,
+            current_core,
+        )
+
+        # -------------------------
+        # Prior games
+        # -------------------------
+
+        prior_games = get_prior_games(
+            SEASON,
+            week,
+            CFBD_API_KEY,
+        )
+
+        team_metrics = build_team_game_metrics(
+            prior_games
+        )
+
+except Exception as error:
+    st.error(
+        "V5 could not load one or more "
+        "model data sources."
+    )
+    st.code(str(error))
+    st.stop()
+
+
+# =========================================================
+# SOURCE WEIGHTS
+# =========================================================
+
+# Established prior:
+# SP+ and FPI receive the largest weights.
+PRIOR_SOURCE_WEIGHTS = {
+    "SP+": 0.40,
+    "FPI": 0.35,
+    "Elo": 0.20,
+    "CORE": 0.05,
+}
+
+# Current season:
+# CORE becomes more useful once a valid
+# pre-game snapshot exists.
+CURRENT_SOURCE_WEIGHTS = {
+    "SP+": 0.30,
+    "FPI": 0.30,
+    "Elo": 0.25,
+    "CORE": 0.15,
+}
+
+
+# =========================================================
+# TEAM RATINGS
+# =========================================================
+
+away_prior_rating, away_prior_components = (
+    consensus_from_maps(
+        away_team,
+        prior_maps,
+        PRIOR_SOURCE_WEIGHTS,
+    )
+)
+
+home_prior_rating, home_prior_components = (
+    consensus_from_maps(
+        home_team,
+        prior_maps,
+        PRIOR_SOURCE_WEIGHTS,
+    )
+)
+
+away_current_rating, away_current_components = (
+    consensus_from_maps(
+        away_team,
+        current_maps,
+        CURRENT_SOURCE_WEIGHTS,
+    )
+)
+
+home_current_rating, home_current_components = (
+    consensus_from_maps(
+        home_team,
+        current_maps,
+        CURRENT_SOURCE_WEIGHTS,
+    )
+)
+
+
+season_weight = current_season_weight(
+    week
+)
+
+
+away_power = blend_team_strength(
+    away_prior_rating,
+    away_current_rating,
+    season_weight,
+)
+
+home_power = blend_team_strength(
+    home_prior_rating,
+    home_current_rating,
+    season_weight,
+)
+
+
+# =========================================================
+# HOME FIELD
+# =========================================================
+
+home_field = (
+    0.0
+    if neutral_site
+    else HOME_FIELD_ADVANTAGE
 )
 
 
@@ -765,29 +1285,118 @@ home_defense_allowed = stabilized_scoring(
 # FAIR SPREAD
 # =========================================================
 
-if selected_game["neutral_site"]:
-    home_field = 0.0
-else:
-    home_field = 2.5
-
-
-rating_difference = (
-    home_rating - away_rating
-)
-
 model_home_margin = (
-    rating_difference
+    home_power
+    - away_power
     + home_field
 )
 
-
-# Limit extreme early-season projections.
+# Guardrail against absurd early model output.
 model_home_margin = max(
     -35.0,
     min(
         35.0,
         model_home_margin,
     ),
+)
+
+
+if model_home_margin >= 0:
+    fair_spread_team = home_team
+    fair_spread_number = (
+        -model_home_margin
+    )
+
+else:
+    fair_spread_team = away_team
+    fair_spread_number = (
+        model_home_margin
+    )
+
+
+# =========================================================
+# GAME SUMMARIES
+# =========================================================
+
+away_summary = team_game_summary(
+    team_metrics,
+    away_team,
+)
+
+home_summary = team_game_summary(
+    team_metrics,
+    home_team,
+)
+
+
+national_scoring_average = (
+    calculate_national_scoring_average(
+        team_metrics
+    )
+)
+
+
+away_offense = stabilized_scoring(
+    away_summary["ppg"],
+    away_summary["games"],
+    national_scoring_average,
+)
+
+away_defense_allowed = stabilized_scoring(
+    away_summary["pa"],
+    away_summary["games"],
+    national_scoring_average,
+)
+
+home_offense = stabilized_scoring(
+    home_summary["ppg"],
+    home_summary["games"],
+    national_scoring_average,
+)
+
+home_defense_allowed = stabilized_scoring(
+    home_summary["pa"],
+    home_summary["games"],
+    national_scoring_average,
+)
+
+
+# =========================================================
+# SP+ OFFENSE / DEFENSE COMPONENTS
+# =========================================================
+
+current_sp_lookup = make_team_lookup(
+    current_sp
+)
+
+away_sp_row = find_team_row(
+    current_sp_lookup,
+    away_team,
+)
+
+home_sp_row = find_team_row(
+    current_sp_lookup,
+    home_team,
+)
+
+away_sp_offense = nested_rating(
+    away_sp_row,
+    "offense",
+)
+
+away_sp_defense = nested_rating(
+    away_sp_row,
+    "defense",
+)
+
+home_sp_offense = nested_rating(
+    home_sp_row,
+    "offense",
+)
+
+home_sp_defense = nested_rating(
+    home_sp_row,
+    "defense",
 )
 
 
@@ -798,24 +1407,49 @@ model_home_margin = max(
 expected_away_points = (
     away_offense
     + home_defense_allowed
-) / 2
+) / 2.0
 
 expected_home_points = (
     home_offense
     + away_defense_allowed
-) / 2
+) / 2.0
 
 
-if not selected_game["neutral_site"]:
+# Small site allocation.
+# This changes scoring distribution but not
+# the total by itself.
+if not neutral_site:
     expected_home_points += 1.25
     expected_away_points -= 1.25
 
 
-model_total = (
+raw_total = (
     expected_home_points
     + expected_away_points
 )
 
+
+# Pull very early totals toward a national
+# baseline instead of trusting tiny samples.
+minimum_games = min(
+    away_summary["games"],
+    home_summary["games"],
+)
+
+total_sample_weight = min(
+    0.75,
+    minimum_games * 0.15,
+)
+
+national_total_baseline = (
+    national_scoring_average * 2.0
+)
+
+model_total = (
+    raw_total * total_sample_weight
+    + national_total_baseline
+    * (1.0 - total_sample_weight)
+)
 
 model_total = max(
     30.0,
@@ -827,231 +1461,282 @@ model_total = max(
 
 
 # =========================================================
+# CONFIDENCE
+# =========================================================
+
+current_disagreement = (
+    source_disagreement(
+        away_current_components,
+        home_current_components,
+    )
+)
+
+common_sources = len(
+    set(
+        item[0]
+        for item in away_current_components
+    ).intersection(
+        item[0]
+        for item in home_current_components
+    )
+)
+
+confidence = calculate_confidence(
+    week,
+    away_summary["games"],
+    home_summary["games"],
+    current_disagreement,
+    common_sources,
+)
+
+
+# =========================================================
 # MODEL DASHBOARD
 # =========================================================
 
 st.divider()
-st.header("🧠 Matchup Edge Model")
 
-col1, col2 = st.columns(2)
+st.header("🧠 V5 Matchup Model")
 
-with col1:
-    st.subheader(away_team)
+col1, col2, col3 = st.columns(3)
 
-    st.metric(
-        "Power Rating",
-        f"{away_rating:+.1f}",
+col1.metric(
+    f"{away_team} Power",
+    f"{away_power:+.1f}",
+)
+
+col2.metric(
+    f"{home_team} Power",
+    f"{home_power:+.1f}",
+)
+
+col3.metric(
+    "Model Confidence",
+    f"{confidence}%",
+)
+
+
+col4, col5, col6 = st.columns(3)
+
+if model_home_margin >= 0:
+    col4.metric(
+        "Model Fair Spread",
+        f"{home_team} "
+        f"-{abs(model_home_margin):.1f}",
+    )
+else:
+    col4.metric(
+        "Model Fair Spread",
+        f"{away_team} "
+        f"-{abs(model_home_margin):.1f}",
     )
 
-    st.metric(
-        "Games in Model",
-        away_metrics["games"],
-    )
+col5.metric(
+    "Model Fair Total",
+    f"{model_total:.1f}",
+)
 
-    st.write(
-        f"**Scoring:** "
-        f"{away_metrics['offense']:.1f} PPG"
-    )
-
-    st.write(
-        f"**Allowed:** "
-        f"{away_metrics['defense']:.1f} PPG"
-    )
+col6.metric(
+    "Home Field",
+    f"{home_field:+.1f}",
+)
 
 
-with col2:
-    st.subheader(home_team)
+# =========================================================
+# SEASON WEIGHTING DISPLAY
+# =========================================================
 
-    st.metric(
-        "Power Rating",
-        f"{home_rating:+.1f}",
-    )
+st.subheader("📅 Early-Season Stabilization")
 
-    st.metric(
-        "Games in Model",
-        home_metrics["games"],
-    )
+prior_pct = (
+    1.0 - season_weight
+) * 100.0
 
-    st.write(
-        f"**Scoring:** "
-        f"{home_metrics['offense']:.1f} PPG"
-    )
+current_pct = (
+    season_weight
+) * 100.0
 
-    st.write(
-        f"**Allowed:** "
-        f"{home_metrics['defense']:.1f} PPG"
-    )
+weight_col1, weight_col2 = st.columns(2)
 
+weight_col1.metric(
+    "2025 Established Strength",
+    f"{prior_pct:.0f}%",
+)
+
+weight_col2.metric(
+    "2026 Current Information",
+    f"{current_pct:.0f}%",
+)
 
 st.caption(
-    "Power ratings are opponent-adjusted, "
-    "recency-weighted and shrunk toward average "
-    "when the current-season sample is small."
-)
-
-
-st.subheader("🎯 Model Fair Lines")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    if model_home_margin >= 0:
-        fair_spread_text = (
-            f"{home_team} "
-            f"-{model_home_margin:.1f}"
-        )
-    else:
-        fair_spread_text = (
-            f"{away_team} "
-            f"-{abs(model_home_margin):.1f}"
-        )
-
-    st.metric(
-        "Fair Spread",
-        fair_spread_text,
-    )
-
-
-with col2:
-    st.metric(
-        "Fair Total",
-        f"{model_total:.1f}",
-    )
-
-
-st.write(
-    f"**Home-field adjustment:** "
-    f"{home_field:+.1f}"
+    "Early in the season, V5 intentionally leans "
+    "heavily on established team strength. "
+    "Current-season information gains weight "
+    "as the sample grows."
 )
 
 
 # =========================================================
-# MODEL CONFIDENCE
+# RATING BREAKDOWN
 # =========================================================
 
-away_games_count = (
-    away_metrics["games"]
-)
+st.subheader("📊 Rating Consensus")
 
-home_games_count = (
-    home_metrics["games"]
-)
+rating_rows = []
 
-minimum_sample = min(
-    away_games_count,
-    home_games_count,
-)
-
-confidence = min(
-    85,
-    45 + minimum_sample * 5,
-)
-
-if minimum_sample == 0:
-    confidence = 35
-
-
-st.metric(
-    "Model Confidence",
-    f"{confidence}/100",
-)
-
-if minimum_sample <= 2:
-    st.info(
-        "Early-season sample is small. "
-        "Ratings are intentionally conservative."
-    )
-
-
-# =========================================================
-# RECENT RESULTS
-# =========================================================
-
-st.divider()
-st.header("📋 Games Used by Model")
-
-
-def history_dataframe(team):
-    rows = []
-
-    for game in team_results.get(
-        team,
-        [],
-    ):
-        margin = game["margin"]
-
-        if margin > 0:
-            result = "W"
-        elif margin < 0:
-            result = "L"
-        else:
-            result = "T"
-
-        rows.append(
-            {
-                "Week": game["week"],
-                "Opponent": game["opponent"],
-                "Site": game["location"],
-                "Result": result,
-                "PF": game["pf"],
-                "PA": game["pa"],
-                "Margin": margin,
-            }
-        )
-
-    if not rows:
-        return pd.DataFrame()
-
-    return pd.DataFrame(
-        sorted(
-            rows,
-            key=lambda row: row["Week"],
-        )
-    )
-
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader(away_team)
-
-    away_history_df = (
-        history_dataframe(
+for source in [
+    "SP+",
+    "FPI",
+    "Elo",
+    "CORE",
+]:
+    away_z = current_maps.get(
+        source,
+        {},
+    ).get(
+        normalize_team_name(
             away_team
         )
     )
 
-    if away_history_df.empty:
-        st.write(
-            "No completed prior games."
-        )
-    else:
-        st.dataframe(
-            away_history_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-with col2:
-    st.subheader(home_team)
-
-    home_history_df = (
-        history_dataframe(
+    home_z = current_maps.get(
+        source,
+        {},
+    ).get(
+        normalize_team_name(
             home_team
         )
     )
 
-    if home_history_df.empty:
-        st.write(
-            "No completed prior games."
-        )
-    else:
-        st.dataframe(
-            home_history_df,
-            use_container_width=True,
-            hide_index=True,
-        )
+    rating_rows.append(
+        {
+            "Source": source,
+            away_team: (
+                round(
+                    z_to_points(
+                        away_z
+                    ),
+                    1,
+                )
+                if away_z is not None
+                else None
+            ),
+            home_team: (
+                round(
+                    z_to_points(
+                        home_z
+                    ),
+                    1,
+                )
+                if home_z is not None
+                else None
+            ),
+        }
+    )
+
+
+rating_df = pd.DataFrame(
+    rating_rows
+)
+
+st.dataframe(
+    rating_df,
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.caption(
+    "Displayed source ratings are normalized "
+    "onto the same internal point scale before "
+    "being blended. They are not the raw values "
+    "published by each rating system."
+)
+
+
+# =========================================================
+# CURRENT-SEASON TEAM PERFORMANCE
+# =========================================================
+
+st.subheader("🏟️ 2026 Performance Before This Game")
+
+performance_df = pd.DataFrame(
+    [
+        {
+            "Team": away_team,
+            "Games": away_summary["games"],
+            "PPG": round(
+                away_summary["ppg"],
+                1,
+            ),
+            "Points Allowed": round(
+                away_summary["pa"],
+                1,
+            ),
+            "Avg Margin": round(
+                away_summary["margin"],
+                1,
+            ),
+        },
+        {
+            "Team": home_team,
+            "Games": home_summary["games"],
+            "PPG": round(
+                home_summary["ppg"],
+                1,
+            ),
+            "Points Allowed": round(
+                home_summary["pa"],
+                1,
+            ),
+            "Avg Margin": round(
+                home_summary["margin"],
+                1,
+            ),
+        },
+    ]
+)
+
+st.dataframe(
+    performance_df,
+    use_container_width=True,
+    hide_index=True,
+)
+
+
+# =========================================================
+# MODEL INTERPRETATION
+# =========================================================
+
+st.subheader("🔍 Model Interpretation")
+
+if current_disagreement <= 2.5:
+    disagreement_text = (
+        "The rating systems are in relatively "
+        "strong agreement on this matchup."
+    )
+
+elif current_disagreement <= 5.0:
+    disagreement_text = (
+        "The rating systems show moderate "
+        "disagreement on this matchup."
+    )
+
+else:
+    disagreement_text = (
+        "The rating systems disagree materially. "
+        "Treat the fair spread with extra caution."
+    )
+
+st.info(
+    disagreement_text
+)
+
+if week <= 3:
+    st.warning(
+        "Early-season model: uncertainty remains "
+        "elevated. V5 deliberately limits the "
+        "influence of tiny 2026 samples."
+    )
 
 
 # =========================================================
@@ -1059,7 +1744,8 @@ with col2:
 # =========================================================
 
 st.divider()
-st.header("🧪 Sportsbook Line Lab")
+
+st.header("🧪 Line Lab")
 
 st.write(
     "Enter the exact line and odds offered by "
@@ -1077,16 +1763,13 @@ bet_type = st.selectbox(
 )
 
 
-model_probability = None
-bet_description = ""
-
-
 # =========================================================
-# SPREAD
+# SPREAD BET
 # =========================================================
 
 if bet_type == "Spread":
-    selected_team = st.selectbox(
+
+    bet_team = st.selectbox(
         "Bet Team",
         [
             away_team,
@@ -1094,102 +1777,104 @@ if bet_type == "Spread":
         ],
     )
 
-    spread_line = st.number_input(
+    spread = st.number_input(
         "Spread",
-        value=0.0,
+        value=-2.5,
         step=0.5,
-        format="%.1f",
     )
 
     odds = st.number_input(
         "American Odds",
         value=-110,
-        step=1,
-        key="spread_odds",
+        step=5,
     )
 
-    if selected_team == home_team:
-        expected_margin = (
+    if bet_team == home_team:
+        team_expected_margin = (
             model_home_margin
         )
+
     else:
-        expected_margin = (
+        team_expected_margin = (
             -model_home_margin
         )
 
-    threshold = -spread_line
+    cover_threshold = -spread
 
-    model_probability = (
-        1 - normal_cdf(
-            (
-                threshold
-                - expected_margin
-            ) / 13.5
-        )
+    z = (
+        team_expected_margin
+        - cover_threshold
+    ) / SPREAD_SIGMA
+
+    model_probability = normal_cdf(
+        z
     )
 
-    bet_description = (
-        f"{selected_team} "
-        f"{spread_line:+.1f}"
+    bet_label = (
+        f"{bet_team} "
+        f"{spread:+.1f}"
     )
 
 
 # =========================================================
-# TOTAL
+# TOTAL BET
 # =========================================================
 
 elif bet_type == "Total":
-    direction = st.selectbox(
-        "Direction",
+
+    total_side = st.selectbox(
+        "Side",
         [
             "Over",
             "Under",
         ],
     )
 
-    total_line = st.number_input(
-        "Total",
-        value=50.0,
+    sportsbook_total = st.number_input(
+        "Sportsbook Total",
+        value=50.5,
         step=0.5,
-        format="%.1f",
     )
 
     odds = st.number_input(
         "American Odds",
         value=-110,
-        step=1,
-        key="total_odds",
+        step=5,
     )
 
-    under_probability = normal_cdf(
-        (
-            total_line
-            - model_total
-        ) / 14.0
+    z = (
+        model_total
+        - sportsbook_total
+    ) / TOTAL_SIGMA
+
+    over_probability = normal_cdf(
+        z
     )
 
-    if direction == "Under":
+    if total_side == "Over":
         model_probability = (
-            under_probability
+            over_probability
         )
     else:
         model_probability = (
-            1 - under_probability
+            1.0
+            - over_probability
         )
 
-    bet_description = (
-        f"{direction} "
-        f"{total_line:.1f}"
+    bet_label = (
+        f"{total_side} "
+        f"{sportsbook_total:.1f}"
     )
 
 
 # =========================================================
-# MONEYLINE
+# MONEYLINE BET
 # =========================================================
 
 else:
-    selected_team = st.selectbox(
-        "Moneyline Team",
+
+    bet_team = st.selectbox(
+        "Bet Team",
         [
             away_team,
             home_team,
@@ -1198,31 +1883,27 @@ else:
 
     odds = st.number_input(
         "American Odds",
-        value=100,
-        step=1,
-        key="moneyline_odds",
+        value=-110,
+        step=5,
     )
 
-    home_win_probability = (
-        1 / (
-            1 + math.exp(
-                -model_home_margin
-                / 6.5
-            )
-        )
+    home_win_probability = logistic(
+        model_home_margin
+        / ML_LOGISTIC_SCALE
     )
 
-    if selected_team == home_team:
+    if bet_team == home_team:
         model_probability = (
             home_win_probability
         )
     else:
         model_probability = (
-            1 - home_win_probability
+            1.0
+            - home_win_probability
         )
 
-    bet_description = (
-        f"{selected_team} ML"
+    bet_label = (
+        f"{bet_team} ML"
     )
 
 
@@ -1230,508 +1911,455 @@ else:
 # BET EVALUATION
 # =========================================================
 
-if odds == 0:
-    st.error(
-        "American odds cannot be zero."
-    )
+break_even = implied_probability(
+    odds
+)
 
-else:
-    break_even = implied_probability(
-        odds
-    )
+probability_edge = (
+    model_probability
+    - break_even
+)
 
-    probability_edge = (
-        model_probability
-        - break_even
-    )
+ev = expected_value(
+    model_probability,
+    odds,
+)
 
-    ev = expected_value(
-        model_probability,
-        odds,
-    )
+grade = edge_grade(
+    probability_edge,
+    ev,
+)
 
-    grade = edge_grade(
-        probability_edge,
-        ev,
-    )
-
-    units = suggested_units(
-        probability_edge,
-        ev,
-    )
-
-
-    st.subheader("📊 Bet Evaluation")
-
-    st.write(
-        f"### {bet_description}"
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.metric(
-            "Model Probability",
-            f"{model_probability * 100:.1f}%",
-        )
-
-        st.metric(
-            "Break-even Probability",
-            f"{break_even * 100:.1f}%",
-        )
-
-    with col2:
-        st.metric(
-            "Probability Edge",
-            f"{probability_edge * 100:+.1f}%",
-        )
-
-        st.metric(
-            "EV per $1",
-            f"${ev:+.3f}",
-        )
-
-
-    st.metric(
-        "Matchup Edge Grade",
-        grade,
-    )
-
-    st.metric(
-        "Suggested Units",
-        f"{units:.1f}u",
-    )
-
-
-    if grade == "A":
-        st.success(
-            "A-grade model edge. "
-            "Still verify injuries, quarterback "
-            "status and market information."
-        )
-
-    elif grade == "B":
-        st.success(
-            "B-grade model edge. "
-            "Potential betting candidate."
-        )
-
-    elif grade == "C":
-        st.warning(
-            "Small model edge. "
-            "Price and matchup details matter."
-        )
-
-    else:
-        st.info(
-            "PASS — current price does not "
-            "provide enough modeled value."
-        )
-
-
-# =========================================================
-# ALTERNATE LINE COMPARISON
-# =========================================================
-
-st.divider()
-st.header("🔬 Compare Alternate Lines")
-
-comparison_type = st.selectbox(
-    "Comparison",
-    [
-        "Spreads",
-        "Totals",
-    ],
+units = suggested_units(
+    probability_edge,
+    ev,
+    confidence,
 )
 
 
-comparison_rows = []
+st.subheader("📊 Bet Evaluation")
+
+st.markdown(
+    f"## {bet_label}"
+)
+
+eval_col1, eval_col2 = st.columns(2)
+
+eval_col1.metric(
+    "Model Probability",
+    f"{model_probability * 100:.1f}%",
+)
+
+eval_col2.metric(
+    "Sportsbook Break-Even",
+    f"{break_even * 100:.1f}%",
+)
 
 
-if comparison_type == "Spreads":
-    comparison_team = st.selectbox(
-        "Team",
-        [
-            away_team,
-            home_team,
-        ],
-        key="comparison_team",
+eval_col3, eval_col4 = st.columns(2)
+
+eval_col3.metric(
+    "Probability Edge",
+    f"{probability_edge * 100:+.1f}%",
+)
+
+eval_col4.metric(
+    "Expected Value",
+    f"{ev * 100:+.1f}%",
+)
+
+
+eval_col5, eval_col6 = st.columns(2)
+
+eval_col5.metric(
+    "Grade",
+    grade,
+)
+
+eval_col6.metric(
+    "Suggested Units",
+    f"{units:.1f}u",
+)
+
+
+if grade == "A":
+    st.success(
+        "A-grade model edge. Verify injuries, "
+        "QB status, matchup context and market "
+        "information before considering a wager."
+    )
+
+elif grade == "B":
+    st.success(
+        "B-grade model edge. Potentially actionable "
+        "after matchup and availability checks."
+    )
+
+elif grade == "C":
+    st.warning(
+        "C-grade edge. Small advantage only."
+    )
+
+else:
+    st.info(
+        "PASS — the price does not currently "
+        "clear the model's threshold."
+    )
+
+
+# =========================================================
+# ALTERNATE SPREAD COMPARISON
+# =========================================================
+
+if bet_type == "Spread":
+
+    st.subheader(
+        "🔀 Alternate Spread Comparison"
     )
 
     default_lines = [
-        -2.5,
-        -1.5,
-        2.5,
-        6.5,
+        spread - 1.5,
+        spread - 0.5,
+        spread + 0.5,
+        spread + 1.5,
     ]
 
-    for i in range(4):
-        col1, col2 = st.columns(2)
+    alternate_rows = []
 
-        with col1:
-            line = st.number_input(
-                f"Line {i + 1}",
-                value=default_lines[i],
-                step=0.5,
-                key=f"spread_line_{i}",
-            )
+    for index, default_line in enumerate(
+        default_lines
+    ):
+        col_a, col_b = st.columns(2)
 
-        with col2:
-            line_odds = st.number_input(
-                f"Odds {i + 1}",
-                value=-110,
-                step=1,
-                key=f"spread_price_{i}",
-            )
-
-        if comparison_team == home_team:
-            expected_margin = (
-                model_home_margin
-            )
-        else:
-            expected_margin = (
-                -model_home_margin
-            )
-
-        probability = (
-            1 - normal_cdf(
-                (
-                    -line
-                    - expected_margin
-                ) / 13.5
-            )
+        alt_line = col_a.number_input(
+            f"Alt Spread {index + 1}",
+            value=float(default_line),
+            step=0.5,
+            key=f"alt_spread_{index}",
         )
 
-        if line_odds != 0:
-            break_even_prob = (
-                implied_probability(
-                    line_odds
-                )
-            )
-
-            edge = (
-                probability
-                - break_even_prob
-            )
-
-            line_ev = expected_value(
-                probability,
-                line_odds,
-            )
-
-            line_grade = edge_grade(
-                edge,
-                line_ev,
-            )
-
-            comparison_rows.append(
-                {
-                    "Bet": (
-                        f"{comparison_team} "
-                        f"{line:+.1f}"
-                    ),
-                    "Odds": line_odds,
-                    "Model Prob": (
-                        f"{probability * 100:.1f}%"
-                    ),
-                    "Break-even": (
-                        f"{break_even_prob * 100:.1f}%"
-                    ),
-                    "Prob Edge": (
-                        f"{edge * 100:+.1f}%"
-                    ),
-                    "EV/$1": (
-                        f"${line_ev:+.3f}"
-                    ),
-                    "Grade": line_grade,
-                }
-            )
-
-
-else:
-    direction = st.selectbox(
-        "Direction",
-        [
-            "Over",
-            "Under",
-        ],
-        key="comparison_direction",
-    )
-
-    default_totals = [
-        45.5,
-        49.5,
-        53.5,
-        57.5,
-    ]
-
-    for i in range(4):
-        col1, col2 = st.columns(2)
-
-        with col1:
-            line = st.number_input(
-                f"Total {i + 1}",
-                value=default_totals[i],
-                step=0.5,
-                key=f"total_line_{i}",
-            )
-
-        with col2:
-            line_odds = st.number_input(
-                f"Odds {i + 1}",
-                value=-110,
-                step=1,
-                key=f"total_price_{i}",
-            )
-
-        under_probability = normal_cdf(
-            (
-                line - model_total
-            ) / 14.0
+        alt_odds = col_b.number_input(
+            f"Alt Odds {index + 1}",
+            value=-110,
+            step=5,
+            key=f"alt_spread_odds_{index}",
         )
 
-        if direction == "Under":
-            probability = (
-                under_probability
-            )
-        else:
-            probability = (
-                1 - under_probability
-            )
+        threshold = -alt_line
 
-        if line_odds != 0:
-            break_even_prob = (
-                implied_probability(
-                    line_odds
-                )
-            )
+        z = (
+            team_expected_margin
+            - threshold
+        ) / SPREAD_SIGMA
 
-            edge = (
-                probability
-                - break_even_prob
-            )
+        probability = normal_cdf(
+            z
+        )
 
-            line_ev = expected_value(
-                probability,
-                line_odds,
-            )
+        be = implied_probability(
+            alt_odds
+        )
 
-            line_grade = edge_grade(
-                edge,
-                line_ev,
-            )
+        edge = probability - be
 
-            comparison_rows.append(
-                {
-                    "Bet": (
-                        f"{direction} "
-                        f"{line:.1f}"
-                    ),
-                    "Odds": line_odds,
-                    "Model Prob": (
-                        f"{probability * 100:.1f}%"
-                    ),
-                    "Break-even": (
-                        f"{break_even_prob * 100:.1f}%"
-                    ),
-                    "Prob Edge": (
-                        f"{edge * 100:+.1f}%"
-                    ),
-                    "EV/$1": (
-                        f"${line_ev:+.3f}"
-                    ),
-                    "Grade": line_grade,
-                }
-            )
+        alt_ev = expected_value(
+            probability,
+            alt_odds,
+        )
 
+        alt_grade = edge_grade(
+            edge,
+            alt_ev,
+        )
 
-if comparison_rows:
-    comparison_df = pd.DataFrame(
-        comparison_rows
-    )
+        alt_units = suggested_units(
+            edge,
+            alt_ev,
+            confidence,
+        )
+
+        alternate_rows.append(
+            {
+                "Line": (
+                    f"{bet_team} "
+                    f"{alt_line:+.1f}"
+                ),
+                "Odds": int(alt_odds),
+                "Model %": round(
+                    probability * 100,
+                    1,
+                ),
+                "Break-Even %": round(
+                    be * 100,
+                    1,
+                ),
+                "Edge %": round(
+                    edge * 100,
+                    1,
+                ),
+                "EV %": round(
+                    alt_ev * 100,
+                    1,
+                ),
+                "Grade": alt_grade,
+                "Units": alt_units,
+            }
+        )
 
     st.dataframe(
-        comparison_df,
+        pd.DataFrame(
+            alternate_rows
+        ),
         use_container_width=True,
         hide_index=True,
     )
 
 
 # =========================================================
-# MODEL NOTES
+# ALTERNATE TOTAL COMPARISON
 # =========================================================
 
-st.divider()
-st.header("🔧 Model Status")
+if bet_type == "Total":
 
-st.markdown(
-    """
-**Currently automatic**
-- 2026 FBS schedule
-- Completed results before selected matchup
-- Recency weighting
-- Opponent-adjusted performance
-- Early-season sample stabilization
-- Offensive scoring
-- Defensive scoring allowed
-- Home-field adjustment
-- Fair spread
-- Fair total
-- Spread probability
-- Total probability
-- Moneyline probability
-- Break-even probability
-- Expected value
-- A/B/C/PASS grades
-- Suggested units
-- Alternate-line comparison
+    st.subheader(
+        "🔀 Alternate Total Comparison"
+    )
 
-**Next data layers**
-- Preseason team-strength priors
-- Advanced offensive efficiency
-- Advanced defensive efficiency
-- Strength of schedule improvements
-- QB performance
-- Rosters / returning production
-- Offensive line / defensive front
-- Injuries
-- Weather
-- Rest / travel
-- Sportsbook odds and line movement
-- Prediction history and CLV
-- Historical backtesting and calibration
-"""
-)
+    default_totals = [
+        sportsbook_total - 3.0,
+        sportsbook_total - 1.0,
+        sportsbook_total + 1.0,
+        sportsbook_total + 3.0,
+    ]
 
-st.caption(
-    "Matchup Edge V4 • "
-    "Data → Matchup → Fair Line → Price → EV"
-)
+    alternate_rows = []
 
+    for index, alt_default in enumerate(
+        default_totals
+    ):
+        col_a, col_b = st.columns(2)
 
-# =========================================================
-# V5 API ACCESS DIAGNOSTIC
-# =========================================================
-
-st.divider()
-st.header("🧪 V5 Data Access Test")
-
-def test_cfbd_endpoint(name, path, params):
-    try:
-        data = cfbd_get(
-            path,
-            params,
-            CFBD_API_KEY,
+        alt_total = col_a.number_input(
+            f"Alt Total {index + 1}",
+            value=float(alt_default),
+            step=0.5,
+            key=f"alt_total_{index}",
         )
 
-        if isinstance(data, list):
-            count = len(data)
+        alt_odds = col_b.number_input(
+            f"Alt Odds {index + 1}",
+            value=-110,
+            step=5,
+            key=f"alt_total_odds_{index}",
+        )
+
+        z = (
+            model_total
+            - alt_total
+        ) / TOTAL_SIGMA
+
+        over_probability = normal_cdf(
+            z
+        )
+
+        if total_side == "Over":
+            probability = (
+                over_probability
+            )
         else:
-            count = 1 if data else 0
+            probability = (
+                1.0
+                - over_probability
+            )
 
-        return {
-            "Source": name,
-            "Status": "✅ WORKING",
-            "Records": count,
-            "Error": "",
+        be = implied_probability(
+            alt_odds
+        )
+
+        edge = probability - be
+
+        alt_ev = expected_value(
+            probability,
+            alt_odds,
+        )
+
+        alt_grade = edge_grade(
+            edge,
+            alt_ev,
+        )
+
+        alt_units = suggested_units(
+            edge,
+            alt_ev,
+            confidence,
+        )
+
+        alternate_rows.append(
+            {
+                "Line": (
+                    f"{total_side} "
+                    f"{alt_total:.1f}"
+                ),
+                "Odds": int(alt_odds),
+                "Model %": round(
+                    probability * 100,
+                    1,
+                ),
+                "Break-Even %": round(
+                    be * 100,
+                    1,
+                ),
+                "Edge %": round(
+                    edge * 100,
+                    1,
+                ),
+                "EV %": round(
+                    alt_ev * 100,
+                    1,
+                ),
+                "Grade": alt_grade,
+                "Units": alt_units,
+            }
+        )
+
+    st.dataframe(
+        pd.DataFrame(
+            alternate_rows
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# =========================================================
+# DATA QUALITY PANEL
+# =========================================================
+
+st.divider()
+
+st.header("🧾 Model Data Quality")
+
+quality_rows = []
+
+for source in [
+    "SP+",
+    "FPI",
+    "Elo",
+    "CORE",
+]:
+    source_map = current_maps.get(
+        source,
+        {},
+    )
+
+    away_available = (
+        normalize_team_name(
+            away_team
+        )
+        in source_map
+    )
+
+    home_available = (
+        normalize_team_name(
+            home_team
+        )
+        in source_map
+    )
+
+    quality_rows.append(
+        {
+            "Source": source,
+            away_team: (
+                "✅"
+                if away_available
+                else "❌"
+            ),
+            home_team: (
+                "✅"
+                if home_available
+                else "❌"
+            ),
         }
-
-    except Exception as error:
-        return {
-            "Source": name,
-            "Status": "❌ BLOCKED / ERROR",
-            "Records": 0,
-            "Error": str(error),
-        }
-
-
-tests = []
-
-tests.append(
-    test_cfbd_endpoint(
-        "CORE",
-        "/ratings/core",
-        {
-            "year": 2026,
-        },
     )
-)
 
-tests.append(
-    test_cfbd_endpoint(
-        "SP+",
-        "/ratings/sp",
-        {
-            "year": 2026,
-        },
-    )
-)
-
-tests.append(
-    test_cfbd_endpoint(
-        "Elo",
-        "/ratings/elo",
-        {
-            "year": 2026,
-            "week": max(1, week - 1),
-            "seasonType": "regular",
-        },
-    )
-)
-
-tests.append(
-    test_cfbd_endpoint(
-        "SRS",
-        "/ratings/srs",
-        {
-            "year": 2026,
-        },
-    )
-)
-
-tests.append(
-    test_cfbd_endpoint(
-        "FPI",
-        "/ratings/fpi",
-        {
-            "year": 2026,
-        },
-    )
-)
-
-
-test_df = pd.DataFrame(tests)
 
 st.dataframe(
-    test_df,
+    pd.DataFrame(
+        quality_rows
+    ),
     use_container_width=True,
     hide_index=True,
 )
 
 
-working_count = sum(
-    1
-    for test in tests
-    if test["Status"] == "✅ WORKING"
+# =========================================================
+# MODEL STATUS
+# =========================================================
+
+st.header("🚧 Model Status")
+
+st.markdown(
+    """
+**V5 currently includes**
+
+- Live CFBD schedule
+- 2025 established-strength prior
+- 2026 SP+ ratings
+- 2026 FPI ratings
+- Week-specific Elo
+- Leakage-protected CORE when available
+- National standardization of rating systems
+- Early-season prior/current-season blending
+- Home-field adjustment
+- Current-season scoring information
+- Fair spread
+- Fair total
+- Spread probability
+- Total probability
+- Moneyline probability
+- Sportsbook break-even probability
+- Expected value
+- A/B/C/PASS grades
+- Confidence-adjusted suggested units
+- Alternate-line comparison
+- Source disagreement measurement
+- Data-quality checks
+
+**Still to add before calling Matchup Edge complete**
+
+- Advanced offensive efficiency
+- Advanced defensive efficiency
+- Passing-vs-secondary matchup
+- Rushing-vs-front matchup
+- Offensive line / defensive front
+- QB-specific performance
+- Returning production
+- Roster talent
+- Transfer impact
+- Injury / availability layer
+- Weather
+- Rest and travel
+- Key-number-aware spread distributions
+- Live sportsbook odds
+- Line movement
+- Prediction history
+- CLV tracking
+- Historical backtesting
+- Probability calibration
+"""
 )
 
 
-if working_count >= 3:
-    st.success(
-        f"{working_count}/5 advanced rating "
-        "sources are accessible. "
-        "We have enough to build V5."
-    )
+st.warning(
+    "V5 is still an experimental decision-support "
+    "model, not a proven betting system. Grades and "
+    "unit suggestions must be validated through "
+    "historical backtesting and calibration before "
+    "being treated as reliable wagering signals."
+)
 
-elif working_count >= 1:
-    st.warning(
-        f"{working_count}/5 advanced rating "
-        "sources are accessible. "
-        "V5 can use the available sources."
-    )
 
-else:
-    st.error(
-        "None of the advanced rating sources "
-        "are accessible with this API key."
-    )
+st.caption(
+    "Matchup Edge V5 • "
+    "Prior → Consensus → Matchup → Fair Line → Price → EV"
+)
