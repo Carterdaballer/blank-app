@@ -4,6 +4,7 @@ import statistics
 import urllib.parse
 import urllib.request
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -13,16 +14,17 @@ import streamlit as st
 # =========================================================
 
 st.set_page_config(
-    page_title="Matchup Edge V5",
+    page_title="Matchup Edge V5.2",
     page_icon="🏈",
     layout="wide",
 )
 
-st.title("🏈 Matchup Edge V5")
+st.title("🏈 Matchup Edge V5.2")
 
 st.caption(
     "Independent college-football matchup model • "
-    "Consensus ratings → matchup → fair line → price → EV"
+    "Consensus ratings → historical calibration → "
+    "fair line → price → EV"
 )
 
 
@@ -33,7 +35,22 @@ st.caption(
 SEASON = 2026
 PREVIOUS_SEASON = 2025
 
-HOME_FIELD_ADVANTAGE = 2.5
+# Seasons used ONLY to learn the relationship between
+# rating differential and scoring margin.
+CALIBRATION_SEASONS = [
+    2023,
+    2024,
+    2025,
+]
+
+# Fallback if historical calibration cannot be built.
+FALLBACK_HOME_FIELD = 2.5
+FALLBACK_RATING_SLOPE = 1.0
+FALLBACK_INTERCEPT = 0.0
+
+# Cap blowouts when fitting the historical regression.
+# This prevents 70-point games from dominating the fit.
+CALIBRATION_MARGIN_CAP = 45.0
 
 SPREAD_SIGMA = 13.5
 TOTAL_SIGMA = 14.0
@@ -45,12 +62,17 @@ ML_LOGISTIC_SCALE = 6.5
 # =========================================================
 
 try:
-    CFBD_API_KEY = st.secrets["CFBD_API_KEY"]
+    CFBD_API_KEY = st.secrets[
+        "CFBD_API_KEY"
+    ]
 
 except Exception:
+
     st.error(
-        "CFBD_API_KEY is missing from Streamlit Secrets."
+        "CFBD_API_KEY is missing from "
+        "Streamlit Secrets."
     )
+
     st.stop()
 
 
@@ -67,13 +89,15 @@ def cfbd_get(
     params,
     api_key,
 ):
+
     base_url = (
         "https://api.collegefootballdata.com"
     )
 
     clean_params = {
         key: value
-        for key, value in params.items()
+        for key, value
+        in params.items()
         if value is not None
     }
 
@@ -89,10 +113,10 @@ def cfbd_get(
     request = urllib.request.Request(
         url,
         headers={
-            "Authorization": (
-                f"Bearer {api_key}"
-            ),
-            "Accept": "application/json",
+            "Authorization":
+                f"Bearer {api_key}",
+            "Accept":
+                "application/json",
         },
     )
 
@@ -100,10 +124,11 @@ def cfbd_get(
         request,
         timeout=30,
     ) as response:
+
         return json.loads(
-            response.read().decode(
-                "utf-8"
-            )
+            response
+            .read()
+            .decode("utf-8")
         )
 
 
@@ -115,7 +140,9 @@ def safe_float(
     value,
     default=None,
 ):
+
     try:
+
         if value is None:
             return default
 
@@ -130,6 +157,7 @@ def safe_float(
         TypeError,
         ValueError,
     ):
+
         return default
 
 
@@ -137,7 +165,9 @@ def safe_int(
     value,
     default=None,
 ):
+
     try:
+
         if value is None:
             return default
 
@@ -147,6 +177,7 @@ def safe_int(
         TypeError,
         ValueError,
     ):
+
         return default
 
 
@@ -155,6 +186,7 @@ def first_value(
     *keys,
     default=None,
 ):
+
     for key in keys:
 
         if key in dictionary:
@@ -182,9 +214,12 @@ def normal_cdf(x):
 
 def logistic(x):
 
-    return 1.0 / (
+    return (
         1.0
-        + math.exp(-x)
+        / (
+            1.0
+            + math.exp(-x)
+        )
     )
 
 
@@ -195,9 +230,11 @@ def logistic(x):
 def american_to_decimal(
     odds,
 ):
+
     odds = float(odds)
 
     if odds > 0:
+
         return (
             1.0
             + odds / 100.0
@@ -213,6 +250,7 @@ def american_to_decimal(
 def implied_probability(
     odds,
 ):
+
     return (
         1.0
         / american_to_decimal(
@@ -225,6 +263,7 @@ def expected_value(
     probability,
     odds,
 ):
+
     decimal_odds = (
         american_to_decimal(
             odds
@@ -320,69 +359,10 @@ def normalize_team_name(
         str(name)
         .strip()
         .lower()
-        .replace(
-            "&",
-            "and",
-        )
-        .replace(
-            ".",
-            "",
-        )
-        .replace(
-            "'",
-            "",
-        )
+        .replace("&", "and")
+        .replace(".", "")
+        .replace("'", "")
     )
-
-
-def make_team_lookup(
-    rows,
-):
-    lookup = {}
-
-    for row in rows:
-
-        team = first_value(
-            row,
-            "team",
-            "school",
-        )
-
-        if team:
-
-            lookup[
-                normalize_team_name(
-                    team
-                )
-            ] = row
-
-    return lookup
-
-
-def find_team_row(
-    lookup,
-    team,
-):
-    key = normalize_team_name(
-        team
-    )
-
-    if key in lookup:
-        return lookup[key]
-
-    for (
-        stored_key,
-        row,
-    ) in lookup.items():
-
-        if (
-            key == stored_key
-            or key in stored_key
-            or stored_key in key
-        ):
-            return row
-
-    return None
 
 
 # =========================================================
@@ -410,6 +390,7 @@ def get_fbs_teams(
 def build_fbs_team_set(
     rows,
 ):
+
     teams = set()
 
     for row in rows:
@@ -509,7 +490,7 @@ def core_rating(row):
 
 
 # =========================================================
-# POINT-SCALE RATING CALIBRATION
+# RAW RATING MAPS
 # =========================================================
 
 def raw_rating_map(
@@ -517,13 +498,6 @@ def raw_rating_map(
     value_getter,
     allowed_teams=None,
 ):
-    """
-    Build team -> raw rating map.
-
-    No arbitrary z-score conversion is used.
-
-    SP+ and FPI retain their point-like scales.
-    """
 
     rating_map = {}
 
@@ -567,20 +541,14 @@ def raw_rating_map(
     return rating_map
 
 
+# =========================================================
+# SP+ / FPI ANCHOR
+# =========================================================
+
 def average_anchor_map(
     sp_map,
     fpi_map,
 ):
-    """
-    SP+ and FPI serve as the primary
-    point-rating anchor.
-
-    If both are available:
-        average them.
-
-    If only one exists:
-        use the available source.
-    """
 
     teams = set(
         sp_map.keys()
@@ -595,6 +563,7 @@ def average_anchor_map(
         values = []
 
         if team in sp_map:
+
             values.append(
                 sp_map[
                     team
@@ -602,6 +571,7 @@ def average_anchor_map(
             )
 
         if team in fpi_map:
+
             values.append(
                 fpi_map[
                     team
@@ -620,21 +590,15 @@ def average_anchor_map(
     return anchor
 
 
+# =========================================================
+# SOURCE-TO-ANCHOR CALIBRATION
+# =========================================================
+
 def linear_fit_to_anchor(
     source_map,
     anchor_map,
     min_teams=20,
 ):
-    """
-    Fits:
-
-    anchor_rating =
-        intercept
-        + slope * source_rating
-
-    Used to translate Elo and CORE
-    onto the SP+/FPI point scale.
-    """
 
     pairs = []
 
@@ -673,63 +637,45 @@ def linear_fit_to_anchor(
     if len(pairs) < min_teams:
         return None
 
-    x_values = [
-        pair[0]
-        for pair in pairs
-    ]
+    x_values = np.array(
+        [
+            pair[0]
+            for pair in pairs
+        ],
+        dtype=float,
+    )
 
-    y_values = [
-        pair[1]
-        for pair in pairs
-    ]
+    y_values = np.array(
+        [
+            pair[1]
+            for pair in pairs
+        ],
+        dtype=float,
+    )
 
-    x_mean = (
-        statistics.mean(
-            x_values
+    design = np.column_stack(
+        [
+            np.ones(
+                len(x_values)
+            ),
+            x_values,
+        ]
+    )
+
+    coefficients, _, _, _ = (
+        np.linalg.lstsq(
+            design,
+            y_values,
+            rcond=None,
         )
     )
 
-    y_mean = (
-        statistics.mean(
-            y_values
-        )
+    intercept = float(
+        coefficients[0]
     )
 
-    denominator = sum(
-        (
-            x
-            - x_mean
-        ) ** 2
-        for x in x_values
-    )
-
-    if denominator == 0:
-        return None
-
-    numerator = sum(
-        (
-            x
-            - x_mean
-        )
-        * (
-            y
-            - y_mean
-        )
-        for (
-            x,
-            y,
-        ) in pairs
-    )
-
-    slope = (
-        numerator
-        / denominator
-    )
-
-    intercept = (
-        y_mean
-        - slope
-        * x_mean
+    slope = float(
+        coefficients[1]
     )
 
     return (
@@ -742,10 +688,6 @@ def transform_map_to_anchor(
     source_map,
     anchor_map,
 ):
-    """
-    Converts Elo or CORE onto the
-    SP+/FPI point-rating scale.
-    """
 
     fit = linear_fit_to_anchor(
         source_map,
@@ -851,16 +793,14 @@ def get_elo(
         {
             "year": year,
             "week": week,
-            "seasonType": (
-                "regular"
-            ),
+            "seasonType": "regular",
         },
         api_key,
     )
 
 
 # =========================================================
-# SCHEDULE
+# SCHEDULE ENDPOINTS
 # =========================================================
 
 @st.cache_data(
@@ -878,12 +818,28 @@ def get_week_games(
         {
             "year": year,
             "week": week,
-            "seasonType": (
-                "regular"
-            ),
-            "classification": (
-                "fbs"
-            ),
+            "seasonType": "regular",
+            "classification": "fbs",
+        },
+        api_key,
+    )
+
+
+@st.cache_data(
+    ttl=21600,
+    show_spinner=False,
+)
+def get_season_games(
+    year,
+    api_key,
+):
+
+    return cfbd_get(
+        "/games",
+        {
+            "year": year,
+            "seasonType": "regular",
+            "classification": "fbs",
         },
         api_key,
     )
@@ -902,6 +858,7 @@ def get_prior_games(
     selected_week,
     api_key,
 ):
+
     all_games = {}
 
     for game_week in range(
@@ -915,15 +872,11 @@ def get_prior_games(
                 "/games",
                 {
                     "year": year,
-                    "week": (
-                        game_week
-                    ),
-                    "seasonType": (
-                        "regular"
-                    ),
-                    "classification": (
-                        "fbs"
-                    ),
+                    "week": game_week,
+                    "seasonType":
+                        "regular",
+                    "classification":
+                        "fbs",
                 },
                 api_key,
             )
@@ -953,12 +906,661 @@ def get_prior_games(
 
 
 # =========================================================
+# CORE FRESHNESS
+# =========================================================
+
+def valid_core_rows(
+    rows,
+    selected_week,
+):
+
+    valid = []
+
+    for row in rows:
+
+        through_week = safe_int(
+            first_value(
+                row,
+                "throughWeek",
+                "through_week",
+            ),
+            default=-1,
+        )
+
+        if through_week < selected_week:
+
+            valid.append(
+                row
+            )
+
+    return valid
+
+
+# =========================================================
+# NATIONAL RATING MAPS
+# =========================================================
+
+def build_rating_maps(
+    sp_rows,
+    fpi_rows,
+    elo_rows,
+    core_rows,
+    fbs_team_set,
+):
+
+    sp_map = raw_rating_map(
+        sp_rows,
+        sp_rating,
+        fbs_team_set,
+    )
+
+    fpi_map = raw_rating_map(
+        fpi_rows,
+        fpi_rating,
+        fbs_team_set,
+    )
+
+    elo_raw = raw_rating_map(
+        elo_rows,
+        elo_rating,
+        fbs_team_set,
+    )
+
+    core_raw = raw_rating_map(
+        core_rows,
+        core_rating,
+        fbs_team_set,
+    )
+
+    anchor_map = (
+        average_anchor_map(
+            sp_map,
+            fpi_map,
+        )
+    )
+
+    elo_map = (
+        transform_map_to_anchor(
+            elo_raw,
+            anchor_map,
+        )
+    )
+
+    core_map = (
+        transform_map_to_anchor(
+            core_raw,
+            anchor_map,
+        )
+    )
+
+    return {
+        "SP+": sp_map,
+        "FPI": fpi_map,
+        "Elo": elo_map,
+        "CORE": core_map,
+    }
+
+
+# =========================================================
+# CONSENSUS TEAM STRENGTH
+# =========================================================
+
+def consensus_from_maps(
+    team,
+    maps,
+    source_weights,
+):
+
+    key = normalize_team_name(
+        team
+    )
+
+    components = []
+
+    for (
+        source,
+        weight,
+    ) in source_weights.items():
+
+        source_map = maps.get(
+            source,
+            {},
+        )
+
+        rating = safe_float(
+            source_map.get(
+                key
+            )
+        )
+
+        if rating is not None:
+
+            components.append(
+                (
+                    source,
+                    rating,
+                    weight,
+                )
+            )
+
+    if not components:
+
+        return (
+            None,
+            [],
+        )
+
+    total_weight = sum(
+        component[2]
+        for component
+        in components
+    )
+
+    if total_weight <= 0:
+
+        return (
+            None,
+            [],
+        )
+
+    consensus_rating = (
+        sum(
+            rating * weight
+
+            for (
+                source,
+                rating,
+                weight,
+            ) in components
+        )
+        / total_weight
+    )
+
+    return (
+        consensus_rating,
+        components,
+    )
+
+
+# =========================================================
+# SOURCE WEIGHTS
+# =========================================================
+
+PRIOR_SOURCE_WEIGHTS = {
+    "SP+": 0.40,
+    "FPI": 0.35,
+    "Elo": 0.20,
+    "CORE": 0.05,
+}
+
+
+CURRENT_SOURCE_WEIGHTS = {
+    "SP+": 0.30,
+    "FPI": 0.30,
+    "Elo": 0.25,
+    "CORE": 0.15,
+}
+
+
+CALIBRATION_SOURCE_WEIGHTS = {
+    "SP+": 0.35,
+    "FPI": 0.35,
+    "Elo": 0.20,
+    "CORE": 0.10,
+}
+
+
+# =========================================================
+# HISTORICAL MARGIN CALIBRATION
+# =========================================================
+
+def fit_margin_calibration(
+    rows,
+):
+    """
+    Fit:
+
+    actual home margin =
+        intercept
+        + rating_slope * rating difference
+        + home_edge * home-site indicator
+
+    Neutral-site games have home indicator = 0.
+
+    Returns a dictionary containing fitted
+    parameters and diagnostics.
+    """
+
+    if len(rows) < 100:
+
+        return {
+            "intercept":
+                FALLBACK_INTERCEPT,
+            "rating_slope":
+                FALLBACK_RATING_SLOPE,
+            "home_edge":
+                FALLBACK_HOME_FIELD,
+            "r2":
+                None,
+            "games":
+                len(rows),
+            "fallback":
+                True,
+        }
+
+    rating_diffs = np.array(
+        [
+            row[
+                "rating_difference"
+            ]
+            for row in rows
+        ],
+        dtype=float,
+    )
+
+    home_indicators = np.array(
+        [
+            row[
+                "home_indicator"
+            ]
+            for row in rows
+        ],
+        dtype=float,
+    )
+
+    margins = np.array(
+        [
+            row[
+                "margin"
+            ]
+            for row in rows
+        ],
+        dtype=float,
+    )
+
+    design = np.column_stack(
+        [
+            np.ones(
+                len(rows)
+            ),
+            rating_diffs,
+            home_indicators,
+        ]
+    )
+
+    coefficients, _, _, _ = (
+        np.linalg.lstsq(
+            design,
+            margins,
+            rcond=None,
+        )
+    )
+
+    intercept = float(
+        coefficients[0]
+    )
+
+    rating_slope = float(
+        coefficients[1]
+    )
+
+    home_edge = float(
+        coefficients[2]
+    )
+
+    predictions = (
+        design
+        @ coefficients
+    )
+
+    residual_ss = float(
+        np.sum(
+            (
+                margins
+                - predictions
+            ) ** 2
+        )
+    )
+
+    total_ss = float(
+        np.sum(
+            (
+                margins
+                - np.mean(
+                    margins
+                )
+            ) ** 2
+        )
+    )
+
+    if total_ss > 0:
+
+        r2 = (
+            1.0
+            - residual_ss
+            / total_ss
+        )
+
+    else:
+
+        r2 = None
+
+    # Sanity guardrails.
+    # Do not let a bad historical fit produce
+    # absurd coefficients.
+
+    if not (
+        0.40
+        <= rating_slope
+        <= 3.00
+    ):
+
+        rating_slope = (
+            FALLBACK_RATING_SLOPE
+        )
+
+    if not (
+        -1.0
+        <= home_edge
+        <= 6.0
+    ):
+
+        home_edge = (
+            FALLBACK_HOME_FIELD
+        )
+
+    if not (
+        -3.0
+        <= intercept
+        <= 3.0
+    ):
+
+        intercept = (
+            FALLBACK_INTERCEPT
+        )
+
+    return {
+        "intercept":
+            intercept,
+        "rating_slope":
+            rating_slope,
+        "home_edge":
+            home_edge,
+        "r2":
+            r2,
+        "games":
+            len(rows),
+        "fallback":
+            False,
+    }
+
+
+@st.cache_data(
+    ttl=21600,
+    show_spinner=False,
+)
+def build_historical_calibration(
+    seasons,
+    api_key,
+):
+    """
+    Build a multi-season historical sample
+    and learn how Matchup Edge rating
+    differences translate into scoring margin.
+
+    This is a SCALE calibration.
+
+    It is NOT yet a clean pregame betting
+    backtest because historical season ratings
+    may contain later-season information.
+    """
+
+    historical_rows = []
+
+    for season in seasons:
+
+        try:
+
+            fbs_rows = get_fbs_teams(
+                season,
+                api_key,
+            )
+
+            fbs_set = (
+                build_fbs_team_set(
+                    fbs_rows
+                )
+            )
+
+            sp_rows = get_sp(
+                season,
+                api_key,
+            )
+
+            fpi_rows = get_fpi(
+                season,
+                api_key,
+            )
+
+            try:
+
+                elo_rows = get_elo(
+                    season,
+                    16,
+                    api_key,
+                )
+
+            except Exception:
+
+                elo_rows = []
+
+            try:
+
+                core_rows = get_core(
+                    season,
+                    api_key,
+                )
+
+            except Exception:
+
+                core_rows = []
+
+            maps = build_rating_maps(
+                sp_rows,
+                fpi_rows,
+                elo_rows,
+                core_rows,
+                fbs_set,
+            )
+
+            games = get_season_games(
+                season,
+                api_key,
+            )
+
+            for game in games:
+
+                if not is_fbs_vs_fbs(
+                    game,
+                    fbs_set,
+                ):
+                    continue
+
+                home_team = first_value(
+                    game,
+                    "homeTeam",
+                    "home_team",
+                )
+
+                away_team = first_value(
+                    game,
+                    "awayTeam",
+                    "away_team",
+                )
+
+                home_points = safe_float(
+                    first_value(
+                        game,
+                        "homePoints",
+                        "home_points",
+                    )
+                )
+
+                away_points = safe_float(
+                    first_value(
+                        game,
+                        "awayPoints",
+                        "away_points",
+                    )
+                )
+
+                if (
+                    home_points is None
+                    or away_points is None
+                ):
+                    continue
+
+                home_rating, _ = (
+                    consensus_from_maps(
+                        home_team,
+                        maps,
+                        CALIBRATION_SOURCE_WEIGHTS,
+                    )
+                )
+
+                away_rating, _ = (
+                    consensus_from_maps(
+                        away_team,
+                        maps,
+                        CALIBRATION_SOURCE_WEIGHTS,
+                    )
+                )
+
+                if (
+                    home_rating is None
+                    or away_rating is None
+                ):
+                    continue
+
+                neutral_site = bool(
+                    first_value(
+                        game,
+                        "neutralSite",
+                        "neutral_site",
+                        default=False,
+                    )
+                )
+
+                actual_margin = (
+                    home_points
+                    - away_points
+                )
+
+                actual_margin = max(
+                    -CALIBRATION_MARGIN_CAP,
+                    min(
+                        CALIBRATION_MARGIN_CAP,
+                        actual_margin,
+                    ),
+                )
+
+                historical_rows.append(
+                    {
+                        "season":
+                            season,
+
+                        "rating_difference":
+                            (
+                                home_rating
+                                - away_rating
+                            ),
+
+                        "home_indicator":
+                            (
+                                0.0
+                                if neutral_site
+                                else 1.0
+                            ),
+
+                        "margin":
+                            actual_margin,
+                    }
+                )
+
+        except Exception:
+            continue
+
+    return fit_margin_calibration(
+        historical_rows
+    )
+
+
+# =========================================================
+# SEASON BLEND
+# =========================================================
+
+def current_season_weight(
+    week,
+):
+
+    weight = (
+        0.15
+        + 0.10
+        * max(
+            0,
+            week - 1,
+        )
+    )
+
+    return min(
+        0.85,
+        max(
+            0.15,
+            weight,
+        ),
+    )
+
+
+def blend_team_strength(
+    prior_rating,
+    current_rating,
+    current_weight,
+):
+
+    if (
+        prior_rating is None
+        and current_rating is None
+    ):
+
+        return None
+
+    if prior_rating is None:
+
+        return current_rating
+
+    if current_rating is None:
+
+        return prior_rating
+
+    return (
+        prior_rating
+        * (
+            1.0
+            - current_weight
+        )
+        + current_rating
+        * current_weight
+    )
+
+
+# =========================================================
 # TEAM GAME METRICS
 # =========================================================
 
 def build_team_game_metrics(
     games,
 ):
+
     metrics = {}
 
     def ensure_team(
@@ -990,34 +1592,29 @@ def build_team_game_metrics(
             "away_team",
         )
 
-        home_points = (
-            safe_float(
-                first_value(
-                    game,
-                    "homePoints",
-                    "home_points",
-                )
+        home_points = safe_float(
+            first_value(
+                game,
+                "homePoints",
+                "home_points",
             )
         )
 
-        away_points = (
-            safe_float(
-                first_value(
-                    game,
-                    "awayPoints",
-                    "away_points",
-                )
+        away_points = safe_float(
+            first_value(
+                game,
+                "awayPoints",
+                "away_points",
             )
         )
 
         if (
             not home
             or not away
-            or home_points
-            is None
-            or away_points
-            is None
+            or home_points is None
+            or away_points is None
         ):
+
             continue
 
         ensure_team(
@@ -1119,290 +1716,90 @@ def team_game_summary(
     )
 
     return {
-        "games": (
+        "games":
             data[
                 "games"
-            ]
-        ),
-        "ppg": average(
-            data[
-                "points_for"
             ],
-            0.0,
-        ),
-        "pa": average(
-            data[
-                "points_against"
-            ],
-            0.0,
-        ),
-        "margin": average(
-            data[
-                "margins"
-            ],
-            0.0,
-        ),
+
+        "ppg":
+            average(
+                data[
+                    "points_for"
+                ],
+                0.0,
+            ),
+
+        "pa":
+            average(
+                data[
+                    "points_against"
+                ],
+                0.0,
+            ),
+
+        "margin":
+            average(
+                data[
+                    "margins"
+                ],
+                0.0,
+            ),
     }
 
 
 # =========================================================
-# CORE FRESHNESS
+# FAIR TOTAL ENGINE
 # =========================================================
 
-def valid_core_rows(
-    rows,
-    selected_week,
+def stabilized_scoring(
+    observed,
+    games_played,
+    national_average,
 ):
 
-    valid = []
+    if games_played <= 0:
 
-    for row in rows:
+        return national_average
 
-        through_week = (
-            safe_int(
-                first_value(
-                    row,
-                    "throughWeek",
-                    "through_week",
-                ),
-                default=-1,
-            )
-        )
-
-        # Strict anti-leakage:
-        # only allow snapshots ending
-        # before the selected game week.
-
-        if (
-            through_week
-            < selected_week
-        ):
-
-            valid.append(
-                row
-            )
-
-    return valid
-
-
-# =========================================================
-# NATIONAL RATING MAPS
-# =========================================================
-
-def build_rating_maps(
-    sp_rows,
-    fpi_rows,
-    elo_rows,
-    core_rows,
-    fbs_team_set,
-):
-    """
-    V5.1 rating system:
-
-    SP+  = native point-like rating
-    FPI  = native point-like rating
-
-    Elo and CORE are statistically
-    translated onto the shared
-    SP+/FPI scale.
-
-    Only FBS programs are used.
-    """
-
-    sp_map = raw_rating_map(
-        sp_rows,
-        sp_rating,
-        fbs_team_set,
-    )
-
-    fpi_map = raw_rating_map(
-        fpi_rows,
-        fpi_rating,
-        fbs_team_set,
-    )
-
-    elo_raw = raw_rating_map(
-        elo_rows,
-        elo_rating,
-        fbs_team_set,
-    )
-
-    core_raw = raw_rating_map(
-        core_rows,
-        core_rating,
-        fbs_team_set,
-    )
-
-    anchor_map = (
-        average_anchor_map(
-            sp_map,
-            fpi_map,
-        )
-    )
-
-    elo_map = (
-        transform_map_to_anchor(
-            elo_raw,
-            anchor_map,
-        )
-    )
-
-    core_map = (
-        transform_map_to_anchor(
-            core_raw,
-            anchor_map,
-        )
-    )
-
-    return {
-        "SP+": sp_map,
-        "FPI": fpi_map,
-        "Elo": elo_map,
-        "CORE": core_map,
-    }
-
-
-# =========================================================
-# CONSENSUS TEAM STRENGTH
-# =========================================================
-
-def consensus_from_maps(
-    team,
-    maps,
-    source_weights,
-):
-
-    key = normalize_team_name(
-        team
-    )
-
-    components = []
-
-    for (
-        source,
-        weight,
-    ) in source_weights.items():
-
-        source_map = maps.get(
-            source,
-            {},
-        )
-
-        rating = safe_float(
-            source_map.get(
-                key
-            )
-        )
-
-        if rating is not None:
-
-            components.append(
-                (
-                    source,
-                    rating,
-                    weight,
-                )
-            )
-
-    # IMPORTANT:
-    # missing data must never
-    # become a fake 0.0 rating.
-
-    if not components:
-        return (
-            None,
-            [],
-        )
-
-    total_weight = sum(
-        component[2]
-        for component
-        in components
-    )
-
-    if total_weight <= 0:
-        return (
-            None,
-            [],
-        )
-
-    consensus_rating = (
-        sum(
-            rating
-            * weight
-
-            for (
-                source,
-                rating,
-                weight,
-            ) in components
-        )
-        / total_weight
+    sample_weight = min(
+        0.80,
+        games_played
+        * 0.12,
     )
 
     return (
-        consensus_rating,
-        components,
-    )
-
-
-# =========================================================
-# SEASON BLEND
-# =========================================================
-
-def current_season_weight(
-    week,
-):
-    """
-    Early season remains prior-heavy,
-    but current information gradually
-    gains influence.
-    """
-
-    weight = (
-        0.15
-        + 0.10
-        * max(
-            0,
-            week - 1,
-        )
-    )
-
-    return min(
-        0.85,
-        max(
-            0.15,
-            weight,
-        ),
-    )
-
-
-def blend_team_strength(
-    prior_rating,
-    current_rating,
-    current_weight,
-):
-
-    if (
-        prior_rating is None
-        and current_rating is None
-    ):
-        return None
-
-    if prior_rating is None:
-        return current_rating
-
-    if current_rating is None:
-        return prior_rating
-
-    return (
-        prior_rating
+        observed
+        * sample_weight
+        + national_average
         * (
             1.0
-            - current_weight
+            - sample_weight
         )
-        + current_rating
-        * current_weight
+    )
+
+
+def calculate_national_scoring_average(
+    metrics,
+):
+
+    scores = []
+
+    for team_data in (
+        metrics.values()
+    ):
+
+        scores.extend(
+            team_data[
+                "points_for"
+            ]
+        )
+
+    if not scores:
+        return 27.5
+
+    return average(
+        scores,
+        27.5,
     )
 
 
@@ -1469,6 +1866,7 @@ def source_disagreement(
     except (
         statistics.StatisticsError
     ):
+
         return 6.0
 
 
@@ -1506,6 +1904,7 @@ def calculate_confidence(
     )
 
     if week <= 2:
+
         confidence -= 5.0
 
     return max(
@@ -1516,63 +1915,6 @@ def calculate_confidence(
                 confidence
             ),
         ),
-    )
-
-
-# =========================================================
-# FAIR TOTAL ENGINE
-# =========================================================
-
-def stabilized_scoring(
-    observed,
-    games_played,
-    national_average,
-):
-
-    if games_played <= 0:
-        return (
-            national_average
-        )
-
-    sample_weight = min(
-        0.80,
-        games_played
-        * 0.12,
-    )
-
-    return (
-        observed
-        * sample_weight
-        + national_average
-        * (
-            1.0
-            - sample_weight
-        )
-    )
-
-
-def calculate_national_scoring_average(
-    metrics,
-):
-
-    scores = []
-
-    for team_data in (
-        metrics.values()
-    ):
-
-        scores.extend(
-            team_data[
-                "points_for"
-            ]
-        )
-
-    if not scores:
-        return 27.5
-
-    return average(
-        scores,
-        27.5,
     )
 
 
@@ -1604,12 +1946,13 @@ def game_label(
 
 
 # =========================================================
-# GAME SELECTION — HOME SCREEN
+# HOME SCREEN GAME SELECTION
 # =========================================================
 
 st.subheader(
     "Game Selection"
 )
+
 
 week = st.selectbox(
     "Week",
@@ -1625,7 +1968,7 @@ week = st.selectbox(
 
 
 # =========================================================
-# LOAD FBS TEAMS + SCHEDULE
+# LOAD CURRENT FBS TEAMS + SCHEDULE
 # =========================================================
 
 try:
@@ -1656,11 +1999,12 @@ try:
             )
         )
 
+
 except Exception as error:
 
     st.error(
-        "Could not load the CFBD schedule "
-        "or FBS team list."
+        "Could not load the CFBD "
+        "schedule or FBS teams."
     )
 
     st.code(
@@ -1676,14 +2020,13 @@ current_fbs_team_set = (
     )
 )
 
+
 previous_fbs_team_set = (
     build_fbs_team_set(
         previous_fbs_rows
     )
 )
 
-
-# Remove all FBS-vs-FCS games.
 
 week_games = [
     game
@@ -1700,8 +2043,9 @@ week_games = [
 if not week_games:
 
     st.warning(
-        f"No FBS vs FBS games were "
-        f"returned for Week {week}."
+        f"No FBS vs FBS games "
+        f"were returned for "
+        f"Week {week}."
     )
 
     st.stop()
@@ -1726,6 +2070,7 @@ away_team = first_value(
     default="Away",
 )
 
+
 home_team = first_value(
     selected_game,
     "homeTeam",
@@ -1734,14 +2079,14 @@ home_team = first_value(
 )
 
 
-# Final FBS safety check.
-
 if (
     normalize_team_name(
         away_team
     )
     not in current_fbs_team_set
+
     or
+
     normalize_team_name(
         home_team
     )
@@ -1749,8 +2094,9 @@ if (
 ):
 
     st.error(
-        "Matchup Edge currently supports "
-        "FBS vs FBS matchups only."
+        "Matchup Edge currently "
+        "supports FBS vs FBS "
+        "matchups only."
     )
 
     st.stop()
@@ -1800,7 +2146,8 @@ away_points = safe_float(
 
 
 st.header(
-    f"{away_team} at {home_team}"
+    f"{away_team} at "
+    f"{home_team}"
 )
 
 
@@ -1844,12 +2191,73 @@ if (
 ):
 
     st.warning(
-        "This game already has a recorded score. "
-        "Current-season snapshot ratings may contain "
-        "information unavailable before kickoff. "
-        "Use V5 primarily for upcoming games until "
-        "historical snapshots are fully implemented."
+        "This game already has a "
+        "recorded score. Use V5.2 "
+        "primarily for upcoming games."
     )
+
+
+# =========================================================
+# HISTORICAL CALIBRATION
+# =========================================================
+
+try:
+
+    with st.spinner(
+        "Calibrating rating scale "
+        "from historical FBS games..."
+    ):
+
+        calibration = (
+            build_historical_calibration(
+                CALIBRATION_SEASONS,
+                CFBD_API_KEY,
+            )
+        )
+
+
+except Exception:
+
+    calibration = {
+        "intercept":
+            FALLBACK_INTERCEPT,
+
+        "rating_slope":
+            FALLBACK_RATING_SLOPE,
+
+        "home_edge":
+            FALLBACK_HOME_FIELD,
+
+        "r2":
+            None,
+
+        "games":
+            0,
+
+        "fallback":
+            True,
+    }
+
+
+calibration_intercept = (
+    calibration[
+        "intercept"
+    ]
+)
+
+
+calibration_slope = (
+    calibration[
+        "rating_slope"
+    ]
+)
+
+
+calibrated_home_field = (
+    calibration[
+        "home_edge"
+    ]
+)
 
 
 # =========================================================
@@ -1859,22 +2267,25 @@ if (
 try:
 
     with st.spinner(
-        "Building V5 consensus model..."
+        "Building V5.2 "
+        "consensus model..."
     ):
 
-        # =================================================
+        # -------------------------
         # 2025 PRIOR
-        # =================================================
+        # -------------------------
 
         prior_sp = get_sp(
             PREVIOUS_SEASON,
             CFBD_API_KEY,
         )
 
+
         prior_fpi = get_fpi(
             PREVIOUS_SEASON,
             CFBD_API_KEY,
         )
+
 
         prior_elo = get_elo(
             PREVIOUS_SEASON,
@@ -1882,32 +2293,31 @@ try:
             CFBD_API_KEY,
         )
 
+
         try:
 
-            prior_core_all = (
-                get_core(
-                    PREVIOUS_SEASON,
-                    CFBD_API_KEY,
-                )
+            prior_core = get_core(
+                PREVIOUS_SEASON,
+                CFBD_API_KEY,
             )
 
         except Exception:
 
-            prior_core_all = []
+            prior_core = []
 
 
         prior_maps = build_rating_maps(
             prior_sp,
             prior_fpi,
             prior_elo,
-            prior_core_all,
+            prior_core,
             previous_fbs_team_set,
         )
 
 
-        # =================================================
+        # -------------------------
         # 2026 CURRENT
-        # =================================================
+        # -------------------------
 
         current_sp = get_sp(
             SEASON,
@@ -1965,9 +2375,9 @@ try:
         )
 
 
-        # =================================================
-        # PRIOR GAMES
-        # =================================================
+        # -------------------------
+        # PRIOR 2026 GAMES
+        # -------------------------
 
         prior_games = get_prior_games(
             SEASON,
@@ -1975,9 +2385,6 @@ try:
             CFBD_API_KEY,
         )
 
-
-        # Remove FBS-vs-FCS games
-        # from performance samples too.
 
         prior_games = [
             game
@@ -2001,8 +2408,9 @@ try:
 except Exception as error:
 
     st.error(
-        "V5 could not load one or more "
-        "model data sources."
+        "V5.2 could not load "
+        "one or more model "
+        "data sources."
     )
 
     st.code(
@@ -2010,26 +2418,6 @@ except Exception as error:
     )
 
     st.stop()
-
-
-# =========================================================
-# SOURCE WEIGHTS
-# =========================================================
-
-PRIOR_SOURCE_WEIGHTS = {
-    "SP+": 0.40,
-    "FPI": 0.35,
-    "Elo": 0.20,
-    "CORE": 0.05,
-}
-
-
-CURRENT_SOURCE_WEIGHTS = {
-    "SP+": 0.30,
-    "FPI": 0.30,
-    "Elo": 0.25,
-    "CORE": 0.15,
-}
 
 
 # =========================================================
@@ -2076,16 +2464,14 @@ CURRENT_SOURCE_WEIGHTS = {
 )
 
 
-# Never assume missing data = average.
-
 if (
     away_prior_rating is None
     and away_current_rating is None
 ):
 
     st.error(
-        f"Insufficient rating data for "
-        f"{away_team}. Fair spread unavailable."
+        f"Insufficient rating data "
+        f"for {away_team}."
     )
 
     st.stop()
@@ -2097,8 +2483,8 @@ if (
 ):
 
     st.error(
-        f"Insufficient rating data for "
-        f"{home_team}. Fair spread unavailable."
+        f"Insufficient rating data "
+        f"for {home_team}."
     )
 
     st.stop()
@@ -2111,17 +2497,21 @@ season_weight = (
 )
 
 
-away_power = blend_team_strength(
-    away_prior_rating,
-    away_current_rating,
-    season_weight,
+away_power = (
+    blend_team_strength(
+        away_prior_rating,
+        away_current_rating,
+        season_weight,
+    )
 )
 
 
-home_power = blend_team_strength(
-    home_prior_rating,
-    home_current_rating,
-    season_weight,
+home_power = (
+    blend_team_strength(
+        home_prior_rating,
+        home_current_rating,
+        season_weight,
+    )
 )
 
 
@@ -2131,61 +2521,46 @@ if (
 ):
 
     st.error(
-        "Insufficient rating data to "
-        "calculate this matchup."
+        "Insufficient rating data "
+        "to calculate this matchup."
     )
 
     st.stop()
 
 
 # =========================================================
-# HOME FIELD
+# CALIBRATED FAIR SPREAD
 # =========================================================
 
-home_field = (
-    0.0
-
-    if neutral_site
-
-    else HOME_FIELD_ADVANTAGE
+raw_rating_difference = (
+    home_power
+    - away_power
 )
 
 
-# =========================================================
-# FAIR SPREAD
-# =========================================================
+site_indicator = (
+    0.0
+    if neutral_site
+    else 1.0
+)
+
 
 model_home_margin = (
-    home_power
-    - away_power
-    + home_field
+    calibration_intercept
+    + calibration_slope
+    * raw_rating_difference
+    + calibrated_home_field
+    * site_indicator
 )
 
 
-# Diagnostic check for
-# unusually large strength gaps.
-
-rating_gap = abs(
-    home_power
-    - away_power
-)
-
-
-if rating_gap > 45:
-
-    st.warning(
-        "Extremely large team-strength "
-        "differential detected. "
-        "Treat this matchup cautiously."
-    )
-
-
-# Temporary model guardrail.
+# Wider cap now that rating scale
+# is historically calibrated.
 
 model_home_margin = max(
-    -35.0,
+    -45.0,
     min(
-        35.0,
+        45.0,
         model_home_margin,
     ),
 )
@@ -2195,15 +2570,19 @@ model_home_margin = max(
 # GAME SUMMARIES
 # =========================================================
 
-away_summary = team_game_summary(
-    team_metrics,
-    away_team,
+away_summary = (
+    team_game_summary(
+        team_metrics,
+        away_team,
+    )
 )
 
 
-home_summary = team_game_summary(
-    team_metrics,
-    home_team,
+home_summary = (
+    team_game_summary(
+        team_metrics,
+        home_team,
+    )
 )
 
 
@@ -2388,7 +2767,7 @@ confidence = (
 st.divider()
 
 st.header(
-    "🧠 V5 Matchup Model"
+    "🧠 V5.2 Matchup Model"
 )
 
 
@@ -2449,8 +2828,13 @@ col5.metric(
 
 
 col6.metric(
-    "Home Field",
-    f"{home_field:+.1f}",
+    "Calibrated Home Field",
+    (
+        f"{calibrated_home_field:+.1f}"
+        if not neutral_site
+
+        else "+0.0"
+    ),
 )
 
 
@@ -2503,56 +2887,142 @@ for source in [
 
     rating_rows.append(
         {
-            "Source": source,
+            "Source":
+                source,
 
-            away_team: (
-                round(
-                    away_rating,
-                    1,
-                )
+            away_team:
+                (
+                    round(
+                        away_rating,
+                        1,
+                    )
+                    if away_rating
+                    is not None
+                    else None
+                ),
 
-                if away_rating
-                is not None
-
-                else None
-            ),
-
-            home_team: (
-                round(
-                    home_rating,
-                    1,
-                )
-
-                if home_rating
-                is not None
-
-                else None
-            ),
+            home_team:
+                (
+                    round(
+                        home_rating,
+                        1,
+                    )
+                    if home_rating
+                    is not None
+                    else None
+                ),
         }
     )
 
 
-rating_df = (
+st.dataframe(
     pd.DataFrame(
         rating_rows
-    )
-)
-
-
-st.dataframe(
-    rating_df,
+    ),
     use_container_width=True,
     hide_index=True,
 )
 
 
 st.caption(
-    "SP+ and FPI retain their point-like "
-    "rating scales. Elo and CORE are "
-    "statistically calibrated onto that "
-    "same scale before consensus strength "
-    "is calculated."
+    "SP+ and FPI anchor the common "
+    "rating scale. Elo and CORE are "
+    "translated onto the same scale "
+    "before consensus strength is calculated."
 )
+
+
+# =========================================================
+# CALIBRATION DIAGNOSTICS
+# =========================================================
+
+with st.expander(
+    "Historical Calibration Details"
+):
+
+    diag_col1, diag_col2 = (
+        st.columns(2)
+    )
+
+
+    diag_col1.metric(
+        "Rating → Margin Multiplier",
+        f"{calibration_slope:.3f}",
+    )
+
+
+    diag_col2.metric(
+        "Historical Home Edge",
+        f"{calibrated_home_field:+.2f}",
+    )
+
+
+    diag_col3, diag_col4 = (
+        st.columns(2)
+    )
+
+
+    diag_col3.metric(
+        "Calibration Games",
+        calibration[
+            "games"
+        ],
+    )
+
+
+    if calibration[
+        "r2"
+    ] is not None:
+
+        diag_col4.metric(
+            "Calibration R²",
+            (
+                f"{calibration['r2']:.3f}"
+            ),
+        )
+
+    else:
+
+        diag_col4.metric(
+            "Calibration R²",
+            "N/A",
+        )
+
+
+    st.write(
+        "Current matchup raw rating gap: "
+        f"{raw_rating_difference:+.2f}"
+    )
+
+
+    st.write(
+        "Calibrated neutral-field margin: "
+        f"{(
+            calibration_intercept
+            + calibration_slope
+            * raw_rating_difference
+        ):+.2f}"
+    )
+
+
+    if calibration[
+        "fallback"
+    ]:
+
+        st.warning(
+            "Historical regression could "
+            "not be built reliably, so the "
+            "model is using fallback calibration."
+        )
+
+    else:
+
+        st.info(
+            "This regression is used to calibrate "
+            "the magnitude of the rating scale. "
+            "It is not yet a leakage-free betting "
+            "backtest."
+        )
 
 
 # =========================================================
@@ -2596,9 +3066,9 @@ st.info(
 if week <= 3:
 
     st.warning(
-        "Early-season model: uncertainty remains "
-        "elevated. V5 limits the influence of "
-        "small current-season samples."
+        "Early-season uncertainty remains elevated. "
+        "V5.2 still limits the influence of small "
+        "current-season samples."
     )
 
 
@@ -2614,8 +3084,7 @@ st.header(
 
 
 st.write(
-    "Enter the exact line and odds offered by "
-    "your sportsbook. Test one price at a time."
+    "Enter one sportsbook line and price at a time."
 )
 
 
@@ -2630,7 +3099,7 @@ bet_type = st.selectbox(
 
 
 # =========================================================
-# SPREAD BET
+# SPREAD
 # =========================================================
 
 if bet_type == "Spread":
@@ -2705,7 +3174,7 @@ if bet_type == "Spread":
 
 
 # =========================================================
-# TOTAL BET
+# TOTAL
 # =========================================================
 
 elif bet_type == "Total":
@@ -2761,7 +3230,6 @@ elif bet_type == "Total":
             over_probability
         )
 
-
     else:
 
         model_probability = (
@@ -2777,7 +3245,7 @@ elif bet_type == "Total":
 
 
 # =========================================================
-# MONEYLINE BET
+# MONEYLINE
 # =========================================================
 
 else:
@@ -2811,7 +3279,6 @@ else:
         model_probability = (
             home_win_probability
         )
-
 
     else:
 
@@ -2964,18 +3431,13 @@ else:
 
 
 # =========================================================
-# ONE ALTERNATE SPREAD TEST
+# ONE ALTERNATE SPREAD
 # =========================================================
 
 if bet_type == "Spread":
 
     st.subheader(
         "🔀 Alternate Spread Test"
-    )
-
-    st.caption(
-        "Test one alternate spread and price "
-        "at a time."
     )
 
 
@@ -2988,8 +3450,7 @@ if bet_type == "Spread":
         alt_col1.number_input(
             "Alt Spread",
             value=float(
-                spread
-                + 1.0
+                spread + 1.0
             ),
             step=0.5,
             key="single_alt_spread",
@@ -3038,22 +3499,28 @@ if bet_type == "Spread":
     )
 
 
-    alt_ev = expected_value(
-        alt_probability,
-        alt_odds,
+    alt_ev = (
+        expected_value(
+            alt_probability,
+            alt_odds,
+        )
     )
 
 
-    alt_grade = edge_grade(
-        alt_edge,
-        alt_ev,
+    alt_grade = (
+        edge_grade(
+            alt_edge,
+            alt_ev,
+        )
     )
 
 
-    alt_units = suggested_units(
-        alt_edge,
-        alt_ev,
-        confidence,
+    alt_units = (
+        suggested_units(
+            alt_edge,
+            alt_ev,
+            confidence,
+        )
     )
 
 
@@ -3123,7 +3590,7 @@ if bet_type == "Spread":
 
 
 # =========================================================
-# DATA QUALITY PANEL
+# DATA QUALITY
 # =========================================================
 
 st.divider()
@@ -3169,23 +3636,22 @@ for source in [
 
     quality_rows.append(
         {
-            "Source": source,
+            "Source":
+                source,
 
-            away_team: (
-                "✅"
-                if away_available
+            away_team:
+                (
+                    "✅"
+                    if away_available
+                    else "❌"
+                ),
 
-                else
-                "❌"
-            ),
-
-            home_team: (
-                "✅"
-                if home_available
-
-                else
-                "❌"
-            ),
+            home_team:
+                (
+                    "✅"
+                    if home_available
+                    else "❌"
+                ),
         }
     )
 
@@ -3210,7 +3676,7 @@ st.header(
 
 st.markdown(
     """
-**V5 currently includes**
+**V5.2 currently includes**
 
 - FBS vs FBS matchups only
 - Live CFBD schedule
@@ -3218,13 +3684,13 @@ st.markdown(
 - 2026 SP+ ratings
 - 2026 FPI ratings
 - Week-specific Elo
-- Leakage-protected CORE when available
-- SP+/FPI anchored point-scale ratings
-- Elo-to-point-scale calibration
-- CORE-to-point-scale calibration
-- Early-season prior/current-season blending
-- Home-field adjustment
-- Current-season scoring information
+- Leakage-protected current CORE
+- SP+/FPI point-scale anchor
+- Elo-to-anchor calibration
+- CORE-to-anchor calibration
+- Multi-season historical rating-to-margin calibration
+- Historically estimated home-field effect
+- Early-season prior/current blending
 - Fair spread
 - Fair total
 - Spread probability
@@ -3233,15 +3699,19 @@ st.markdown(
 - Sportsbook break-even probability
 - Expected value
 - A/B/C/PASS grades
-- Confidence-adjusted suggested units
-- One alternate-spread test at a time
-- Source disagreement measurement
+- Confidence-adjusted units
+- One alternate-spread test
+- Source disagreement
 - Data-quality checks
 
-**Still to add before calling Matchup Edge complete**
+**Still needed before Matchup Edge is a validated betting model**
 
-- Historical spread calibration
-- Closing-line backtesting
+- Pregame historical rating snapshots
+- Historical closing sportsbook spreads
+- Leakage-free backtesting
+- Out-of-sample validation
+- Probability calibration
+- Key-number-aware spread distributions
 - Advanced offensive efficiency
 - Advanced defensive efficiency
 - Passing-vs-secondary matchup
@@ -3251,30 +3721,29 @@ st.markdown(
 - Returning production
 - Roster talent
 - Transfer impact
-- Injury / availability layer
+- Injuries
 - Weather
 - Rest and travel
-- Key-number-aware spread distributions
 - Live sportsbook odds
 - Line movement
 - Prediction history
 - CLV tracking
-- Probability calibration
 """
 )
 
 
 st.warning(
-    "V5 remains an experimental decision-support "
-    "model. The new rating scale fixes the prior "
-    "arbitrary z-score compression, but fair spreads "
-    "still need historical backtesting and calibration "
-    "before they should be treated as proven wagering signals."
+    "V5.2 now learns the relationship between "
+    "team-rating differential and scoring margin "
+    "instead of assuming they are identical. "
+    "The calibration is still not a leakage-free "
+    "historical betting backtest, so outputs should "
+    "remain experimental until that validation is complete."
 )
 
 
 st.caption(
-    "Matchup Edge V5 • "
-    "Prior → Consensus → Matchup → "
+    "Matchup Edge V5.2 • "
+    "Ratings → Historical Calibration → "
     "Fair Line → Price → EV"
 )
